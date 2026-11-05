@@ -413,7 +413,7 @@ def test_mapping_scan_replaces_the_input_then_hands_back():
 
     # input arriving during a scan is remembered and shown once the scan is over
     dev.start_scan(slot=0.4, brightness=50, color="rgb", repeat=1)
-    eng.handle_artnet(artnet.encode_dmx(0, bytes([9, 8, 7, 6] * 8)), "2.0.0.1")
+    eng.feed("artnet", 0, bytes([9, 8, 7, 6] * 8), "2.0.0.1", now[0])  # stamped with the test clock
     dev.frame_step(now[0])
     assert pixels() == bytes(8 * 4)  # lead slot of the new scan, not the Art-Net look
     dev.stop_scan()
