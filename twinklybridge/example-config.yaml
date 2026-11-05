@@ -1,0 +1,58 @@
+# Twinkly Bridge configuration
+#
+# Art-Net (or sACN) comes in from the console / Madrix / Arena. Each Twinkly
+# controller listed under devices gets its pixels from a run of universes and
+# is driven pixel by pixel over Twinkly's realtime protocol.
+#
+# Art-Net universes are written net.subnet.universe (0.0.0 is the first one;
+# some software calls that "universe 1"). sACN universes are numbers from 1.
+#
+# Pixels never straddle two universes: an RGBW pixel is 4 channels, so a
+# universe holds 128 of them (170 for RGB). A 1500 pixel RGBW controller uses
+# 12 universes. `twinkly-bridge check` prints the whole map.
+
+input:
+  cidr: 2.0.0.20/8          # this box's IP on the console network (for ArtPollReply)
+  artnet: true
+  sacn: false
+  reply: broadcast          # ArtPollReply: broadcast | unicast
+  short_name: TwinklyBridge # how Madrix / Arena / MA lists this node (max 17 chars)
+
+# Applied to every device unless the device says otherwise.
+defaults:
+  input: RGBW               # how the console patches one pixel: RGBW, RGB, GRBW, ...
+  order: auto               # bytes on the wire to the Twinkly; auto = WRGB for RGBW strands, RGB for RGB
+  fps: 25                   # frames per second sent to each controller (Twinkly runs about 24)
+  on_loss: hold             # input stops: hold (last look) | black | release (back to the app's effect)
+  loss_timeout: 5           # seconds without input before on_loss kicks in
+
+devices:
+  - name: Tree 1
+    ip: 10.20.30.101
+    universe: 0.0.0         # first universe; the next ones follow on (0.0.0 - 0.0.11 here)
+    pixels: 1500
+
+  - name: Tree 2
+    ip: 10.20.30.102
+    universe: 0.0.12
+    pixels: 1500
+
+  # Everything is optional except ip, universe and pixels:
+  # - name: Arch
+  #   ip: 10.20.30.110
+  #   universe: 0.1.0
+  #   pixels: 600
+  #   start_channel: 1        # where the first pixel starts in the first universe
+  #   pixels_per_universe: 0  # 0 = as many as fit
+  #   input: RGB              # this one is patched as RGB on the console
+  #   order: auto
+  #   fps: 30
+  #   on_loss: release
+  #   enabled: true
+
+web:
+  enabled: true
+  bind: 0.0.0.0
+  port: 8080
+
+log_level: info             # debug | info | warning | error
