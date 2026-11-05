@@ -157,13 +157,9 @@ class FakeTwinkly:
                     "led_drv": "d9865c",
                     "led_id": 182,
                     "led_profile": self.profile,
+                    # like the real device: every port's string starts at 1 again
                     "ports": [
-                        {
-                            "port_id": i,
-                            "strings": [
-                                {"start": 1 + i * (self.pixels // self.ports), "len": self.pixels // self.ports}
-                            ],
-                        }
+                        {"port_id": i, "strings": [{"start": 1, "len": self.pixels // self.ports}]}
                         for i in range(self.ports)
                     ],
                 },
