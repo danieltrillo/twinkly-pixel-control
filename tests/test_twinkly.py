@@ -3,7 +3,6 @@ from twinklybridge.twinkly import (
     FRAGMENT_BYTES,
     DeviceInfo,
     build_packets,
-    pack_ip_reversed,
     parse_discovery_reply,
     protocol_for_firmware,
     valid_order,
@@ -18,6 +17,7 @@ def test_protocol_for_firmware():
     assert protocol_for_firmware("2.4.6") == 2
     assert protocol_for_firmware("1.99.24") == 1
     assert protocol_for_firmware("3.5.0") == 3
+    assert protocol_for_firmware("") == 3  # Pro v2 firmware hides its version
 
 
 def test_v3_fragments_at_900_bytes():
@@ -68,13 +68,45 @@ def test_valid_order():
     assert not valid_order("RGGB") and not valid_order("RG") and not valid_order("RGBWX")
 
 
-def test_discovery_reply():
-    data = pack_ip_reversed("10.20.30.101") + b"OK" + b"Twinkly_ABC123\x00"
-    d = parse_discovery_reply(data, "10.20.30.101")
+def test_discovery_reply_consumer_and_pro():
+    import socket
+
+    d = parse_discovery_reply(socket.inet_aton("10.20.30.101")[::-1] + b"OKTwinkly_ABC123\x00", "10.20.30.101")
     assert (d.ip, d.name) == ("10.20.30.101", "Twinkly_ABC123")
+    # captured from a TWPROCTRLPLC21 (Pro): "TP" status, IP in network order
+    pro = parse_discovery_reply(b"\n\xc9RiTPTwPRO_a02bbd\x00", "10.201.82.105")
+    assert (pro.ip, pro.name) == ("10.201.82.105", "TwPRO_a02bbd")
+    assert parse_discovery_reply(b"\n\xc9RiTPTwPRO_a02bbd\x00", "").ip == "10.201.82.105"
     assert parse_discovery_reply(b"\x01discover", "1.2.3.4") is None
 
 
 def test_device_info_from_gestalt():
     info = DeviceInfo.from_api({"led_profile": "rgbw", "number_of_led": "1500", "product_code": "X"}, "2.8.18")
     assert info.bytes_per_led == 4 and info.number_of_led == 1500 and info.firmware == "2.8.18"
+
+
+def test_device_info_from_pro_v2_gestalt():
+    # trimmed from a real TWPROCTRLPLC21 /xled/v2/gestalt
+    g = {
+        "product_code": "TWPROCTRLPLC21",
+        "device_name": "Twinklee",
+        "max_supported_led": 1500,
+        "number_of_led": 1440,
+        "device_config": {"led_profile": "RGBW", "ports": [{"port_id": 0, "strings": [{"start": 1, "len": 240}]}]},
+        "group": {"mode": "slave", "size": 36000, "offset": 34560},
+        "frame_rate": 10,
+        "artnet_en": True,
+        "result": {"code": 1000},
+    }
+    info = DeviceInfo.from_api(g, "", "v2")
+    assert (info.led_profile, info.bytes_per_led, info.number_of_led) == ("RGBW", 4, 1440)
+    assert (info.group_mode, info.group_offset, info.group_size) == ("slave", 34560, 36000)
+    assert info.artnet_enabled is True and info.api == "v2"
+
+
+def test_result_code_both_shapes():
+    from twinklybridge.twinkly import result_code
+
+    assert result_code({"code": 1000}) == 1000
+    assert result_code({"result": {"code": 1000}}) == 1000
+    assert result_code({"mode": "rt"}) is None

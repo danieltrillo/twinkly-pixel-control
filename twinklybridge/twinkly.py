@@ -38,6 +38,20 @@ class AuthError(TwinklyError):
     """The device rejected our token (HTTP 401)."""
 
 
+class NotFound(TwinklyError):
+    """The endpoint does not exist on this firmware (HTTP 404 / code 2404)."""
+
+
+def result_code(reply: dict) -> int | None:
+    """v1 replies carry {"code": 1000}; v2 (Pro firmware) carry {"result": {"code": 1000}}."""
+    if isinstance(reply.get("code"), int):
+        return reply["code"]
+    result = reply.get("result")
+    if isinstance(result, dict) and isinstance(result.get("code"), int):
+        return result["code"]
+    return None
+
+
 # --------------------------------------------------------------------------
 # Wire format
 # --------------------------------------------------------------------------
@@ -52,7 +66,12 @@ def version_tuple(text: str) -> tuple[int, ...]:
 
 
 def protocol_for_firmware(fw: str) -> int:
-    """UDP realtime protocol version: v3 (fragmented) for 2.4.14 and newer."""
+    """UDP realtime protocol version: v3 (fragmented) for 2.4.14 and newer.
+
+    Firmware that hides its version (newer Pro, /xled/v2 only) is modern: v3.
+    """
+    if not str(fw).strip():
+        return 3
     v = version_tuple(fw)
     if v >= (2, 4, 14):
         return 3
@@ -110,31 +129,45 @@ class DeviceInfo:
     measured_frame_rate: float | None = None
     mac: str = ""
     fw_family: str = ""
+    api: str = "v1"
+    group_mode: str = ""
+    group_offset: int = 0
+    group_size: int = 0
+    artnet_enabled: bool | None = None
 
     @property
     def bytes_per_led(self) -> int:
         return 4 if self.led_profile.upper() == "RGBW" else 3
 
     @classmethod
-    def from_api(cls, gestalt: dict[str, Any], firmware: str) -> DeviceInfo:
-        def num(key: str, default: float = 0) -> float:
+    def from_api(cls, gestalt: dict[str, Any], firmware: str, api: str = "v1") -> DeviceInfo:
+        def num(key: str, default: float = 0, src: dict | None = None) -> float:
             try:
-                return float(gestalt.get(key, default))
+                return float((src if src is not None else gestalt).get(key, default))
             except (TypeError, ValueError):
                 return default
 
         measured = gestalt.get("measured_frame_rate")
+        device_config = gestalt.get("device_config") if isinstance(gestalt.get("device_config"), dict) else {}
+        group = gestalt.get("group") if isinstance(gestalt.get("group"), dict) else {}
+        profile = gestalt.get("led_profile") or device_config.get("led_profile") or "RGB"
+        artnet = gestalt.get("artnet_en")
         return cls(
             firmware=str(firmware or ""),
             product_code=str(gestalt.get("product_code", "")),
             device_name=str(gestalt.get("device_name", "")),
-            led_profile=str(gestalt.get("led_profile", "RGB")).upper(),
+            led_profile=str(profile).upper(),
             number_of_led=int(num("number_of_led")),
             max_supported_led=int(num("max_supported_led")),
             frame_rate=num("frame_rate"),
             measured_frame_rate=float(measured) if isinstance(measured, (int, float)) else None,
             mac=str(gestalt.get("mac", "")),
             fw_family=str(gestalt.get("fw_family", "")),
+            api=api,
+            group_mode=str(group.get("mode", "")),
+            group_offset=int(num("offset", 0, group)),
+            group_size=int(num("size", 0, group)),
+            artnet_enabled=artnet if isinstance(artnet, bool) else None,
         )
 
     def to_dict(self) -> dict:
@@ -148,6 +181,11 @@ class DeviceInfo:
             "frame_rate": self.frame_rate,
             "measured_frame_rate": self.measured_frame_rate,
             "mac": self.mac,
+            "api": self.api,
+            "group_mode": self.group_mode,
+            "group_offset": self.group_offset,
+            "group_size": self.group_size,
+            "artnet_enabled": self.artnet_enabled,
         }
 
 
@@ -162,10 +200,15 @@ class TwinklyClient:
     def __init__(self, session: Any, ip: str, *, port: int = HTTP_PORT, timeout: float = 3.0) -> None:
         self.session = session
         self.ip = ip
-        self.base = f"http://{ip}:{port}/xled/v1"
+        self.root = f"http://{ip}:{port}/xled"
+        self.api = ""  # "v1" (consumer / older Pro firmware) or "v2" (newer Pro firmware); found by detect()
         self.timeout = timeout
         self.token_b64 = ""
         self.token = b""
+
+    @property
+    def base(self) -> str:
+        return f"{self.root}/{self.api or 'v1'}"
 
     async def _request(self, method: str, path: str, body: dict | None = None, auth: bool = True) -> dict:
         import aiohttp
@@ -183,6 +226,8 @@ class TwinklyClient:
             ) as resp:
                 if resp.status == 401:
                     raise AuthError(f"{path}: token rejected")
+                if resp.status == 404:
+                    raise NotFound(f"{method} /xled/{self.api or 'v1'}{path}: not on this firmware")
                 if resp.status >= 400:
                     text = (await resp.text())[:120]
                     raise TwinklyError(f"{method} {path}: HTTP {resp.status} {text}")
@@ -217,25 +262,46 @@ class TwinklyClient:
         self.token_b64 = token
         self.token = raw
         verify = await self._request("POST", "/verify", {"challenge-response": reply.get("challenge-response", "")})
-        if verify.get("code") != CODE_OK:
+        if result_code(verify) != CODE_OK:
             raise TwinklyError(f"verify refused: {verify}")
 
+    async def detect(self) -> dict:
+        """Find which API generation the device speaks and return its gestalt."""
+        for api in ("v1", "v2"):
+            self.api = api
+            try:
+                return await self._request("GET", "/gestalt", auth=False)
+            except NotFound:
+                continue
+        self.api = ""
+        raise TwinklyError(f"{self.ip} answers HTTP but has no /xled/v1 or /xled/v2 gestalt; is it a Twinkly?")
+
     async def info(self) -> DeviceInfo:
-        fw = await self._request("GET", "/fw/version", auth=False)
-        gestalt = await self._request("GET", "/gestalt", auth=False)
-        return DeviceInfo.from_api(gestalt, fw.get("version", ""))
+        gestalt = await self.detect()
+        try:
+            fw = (await self._request("GET", "/fw/version", auth=False)).get("version", "")
+        except NotFound:
+            fw = ""  # newer Pro firmware has no fw/version endpoint
+        return DeviceInfo.from_api(gestalt, fw, self.api)
 
     async def get_mode(self) -> str:
-        reply = await self._request("GET", "/led/mode")
+        """Current LED mode, or "" when the firmware doesn't expose it."""
+        try:
+            reply = await self._request("GET", "/led/mode")
+        except NotFound:
+            return ""
         return str(reply.get("mode", ""))
 
     async def set_mode(self, mode: str) -> None:
         reply = await self._request("POST", "/led/mode", {"mode": mode})
-        if reply.get("code") != CODE_OK:
+        if result_code(reply) != CODE_OK:
             raise TwinklyError(f"set mode {mode!r} refused: {reply}")
 
     async def led_config(self) -> list[dict]:
-        reply = await self._request("GET", "/led/config")
+        try:
+            reply = await self._request("GET", "/led/config")
+        except NotFound:
+            return []
         strings = reply.get("strings")
         return strings if isinstance(strings, list) else []
 
@@ -254,13 +320,16 @@ class Discovered:
 
 
 def parse_discovery_reply(data: bytes, sender_ip: str) -> Discovered | None:
-    """Reply: 4 bytes IP (reversed), b"OK", device name, NUL."""
-    if len(data) < 6 or data[4:6] != b"OK":
+    """Reply: 4 bytes IP, 2 status bytes, device name, NUL.
+
+    Consumer devices answer b"OK"; Pro controllers answer b"TP". The docs say
+    the IP is byte-reversed, but a Pro sends it in network order, so the UDP
+    sender address is used when we have it.
+    """
+    if len(data) < 7 or data[:9] == DISCOVERY_REQUEST or not data[4:6].isalpha():
         return None
     name = data[6:].split(b"\x00", 1)[0].decode("utf-8", "replace")
-    ip = socket.inet_ntoa(bytes(reversed(data[0:4])))
-    if ip == "0.0.0.0":
-        ip = sender_ip
+    ip = sender_ip or socket.inet_ntoa(data[0:4])
     return Discovered(ip=ip, name=name)
 
 
@@ -290,11 +359,6 @@ def discover(broadcast: str = "255.255.255.255", timeout: float = 2.0, bind_ip: 
     finally:
         sock.close()
     return sorted(found.values(), key=lambda d: socket.inet_aton(d.ip))
-
-
-def pack_ip_reversed(ip: str) -> bytes:
-    """Helper for tests and fakes: the IP field of a discovery reply."""
-    return bytes(reversed(socket.inet_aton(ip)))
 
 
 __all__ = [
