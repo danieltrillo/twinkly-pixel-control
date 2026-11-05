@@ -9,8 +9,9 @@ import signal
 import time
 
 from . import __version__
-from .config import Config, ConfigError, load_config, overlaps
+from .config import Config, ConfigError, MappingConfig, load_config, overlaps
 from .engine import Engine
+from .mapstore import MapStore
 
 log = logging.getLogger(__name__)
 
@@ -42,6 +43,7 @@ class Supervisor:
         self.config: Config | None = None
         self.config_error = ""
         self.engine: Engine | None = None
+        self.mapstore: MapStore | None = None
         self.ring = RingLogHandler()
         self.ring.setFormatter(logging.Formatter("%(message)s"))
         self._stop = asyncio.Event()
@@ -71,6 +73,10 @@ class Supervisor:
             await old.stop()
         self.config = config
         self.config_error = ""
+        if self.mapstore is not None:
+            if config.mapping.dir and self.mapstore.root != config.mapping.dir:
+                log.warning("mapping.dir changed; restart the bridge to use %s", config.mapping.dir)
+            self.mapstore.cfg = config.mapping
         logging.getLogger("twinklybridge").setLevel(config.log_level.upper())
         for warning in overlaps(config):
             log.warning("note: %s", warning)
@@ -108,6 +114,13 @@ class Supervisor:
             self.config_error = str(exc)
             log.error("config error: %s", exc)
 
+        self.mapstore = MapStore(self.config.mapping if self.config else MappingConfig(), self.config_path)
+        try:
+            await self.mapstore.start()
+        except OSError as exc:
+            log.error("camera mapping is off: cannot use %s: %s", self.mapstore.root, exc)
+            self.mapstore = None
+
         if self.web_override is not None:
             await self._start_web(*self.web_override)
         elif self.config is None:
@@ -124,6 +137,8 @@ class Supervisor:
             await self.engine.stop()
         if self._web_runner is not None:
             await self._web_runner.cleanup()
+        if self.mapstore is not None:
+            await self.mapstore.stop()
         return 0
 
     async def _start_web(self, bind: str, port: int) -> None:

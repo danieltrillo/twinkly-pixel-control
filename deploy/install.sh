@@ -4,9 +4,11 @@
 #   From a checkout:  sudo ./deploy/install.sh
 #   From anywhere:    curl -fsSL https://raw.githubusercontent.com/danieltrillo/twinkly-pixel-control/main/deploy/install.sh | sudo bash
 #
-# What it does: installs python3 + python3-yaml + python3-aiohttp, copies the
-# code to /opt/twinkly-bridge, creates /etc/twinkly-bridge/config.yaml from the example
-# if there is none, and enables the systemd service.
+# What it does: installs python3 + python3-yaml + python3-aiohttp (plus numpy,
+# OpenCV and scipy for camera pixel mapping), copies the code to
+# /opt/twinkly-bridge, creates /etc/twinkly-bridge/config.yaml from the example
+# if there is none, and enables the systemd service. Mapping clips and results
+# live in /var/lib/twinkly-bridge/mapping.
 
 set -euo pipefail
 
@@ -24,6 +26,10 @@ fi
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y -qq --no-install-recommends python3 python3-yaml python3-aiohttp git ca-certificates >/dev/null
+# Camera pixel mapping (the /map page) decodes videos with numpy, OpenCV and scipy. Skip with TWINKLY_BRIDGE_MAPPING=0.
+if [[ "${TWINKLY_BRIDGE_MAPPING:-1}" != "0" ]]; then
+  apt-get install -y -qq --no-install-recommends python3-numpy python3-opencv python3-scipy >/dev/null
+fi
 
 # Where is the source? A checkout next to this script, or a fresh clone.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || true)"
@@ -81,6 +87,7 @@ EOF
   echo "  config:  $CONFIG_DIR/config.yaml   (twinkly-bridge check -c $CONFIG_DIR/config.yaml)"
   echo "  logs:    journalctl -u twinkly-bridge -f"
   echo "  status:  http://<this-host>:$PORT"
+  echo "  mapping: http://<this-host>:$PORT/map   (clips + results in /var/lib/twinkly-bridge/mapping)"
   echo "  this host's addresses:"
   ip -4 -brief addr | grep -v "^lo" | sed "s/^/    /"
 else

@@ -18,6 +18,9 @@ RestartSec=2
 # Give the bridge time to hand every controller back to its own effect.
 TimeoutStopSec=15
 
+# Camera mapping clips and results: /var/lib/twinkly-bridge (the only writable place).
+StateDirectory=twinkly-bridge
+
 NoNewPrivileges=true
 ProtectSystem=strict
 ReadOnlyPaths=/etc/twinkly-bridge
