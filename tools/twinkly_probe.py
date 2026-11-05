@@ -424,29 +424,32 @@ OUTPUT_COLORS = [
 
 
 def output_ranges(dev, g, n):
-    """Pixel ranges per physical output, as (first, end) 0-based half-open, in output order."""
+    """Pixel ranges per string, as (first, end, label) 0-based half-open, in output order.
+
+    An output with a splitter and two strings in its layout gets two ranges."""
     ranges = []
     offset = 0
-    for port in device_config(g).get("ports", []):
+    for k, port in enumerate(device_config(g).get("ports", [])):
         # Pro v2: each port's strings start at 1 again (start is 1-based *within the port*);
         # the frame itself runs port by port, so lay the ports out one after another.
+        strings = [st for st in port.get("strings", []) if int(st.get("len", 0)) > 0]
         port_len = 0
-        for st in port.get("strings", []):
+        for j, st in enumerate(strings):
             start, length = max(int(st.get("start", 1)) - 1, 0), int(st.get("len", 0))
-            if length > 0:
-                ranges.append((offset + start, offset + start + length))
-                port_len = max(port_len, start + length)
+            label = f"output {k + 1}" + (f" string {j + 1}" if len(strings) > 1 else "")
+            ranges.append((offset + start, offset + start + length, label))
+            port_len = max(port_len, start + length)
         offset += port_len
     if not ranges and dev.api == "v1":
         try:
-            for st in dev.get("/led/config").get("strings", []):
+            for k, st in enumerate(dev.get("/led/config").get("strings", [])):
                 first, length = int(st.get("first_led_id", 0)), int(st.get("length", 0))
                 if length > 0:
-                    ranges.append((first, first + length))
+                    ranges.append((first, first + length, f"output {k + 1}"))
         except RuntimeError:
             pass
-    ranges = [(a, min(b, n)) for a, b in ranges if a < n]
-    return ranges or [(0, n)]
+    ranges = [(a, min(b, n), label) for a, b, label in ranges if a < n]
+    return ranges or [(0, n, "all pixels")]
 
 
 def run_chunks(dev, fps, order, proto_override, hold):
@@ -462,18 +465,18 @@ def run_chunks(dev, fps, order, proto_override, hold):
     s = Streamer(dev, n, profile, proto, order)
     ranges = output_ranges(dev, g, n)
     black = [(0, 0, 0, 0)] * n
-    print(f"\n  {len(ranges)} output(s):")
-    for k, (a, b) in enumerate(ranges):
-        print(f"    output {k + 1}: pixels {a + 1}-{b} ({b - a} px) = {OUTPUT_COLORS[k % len(OUTPUT_COLORS)][0]}")
+    print(f"\n  {len(ranges)} string(s):")
+    for k, (a, b, label) in enumerate(ranges):
+        print(f"    {label}: pixels {a + 1}-{b} ({b - a} px) = {OUTPUT_COLORS[k % len(OUTPUT_COLORS)][0]}")
 
     def all_outputs(t):
         px = list(black)
-        for k, (a, b) in enumerate(ranges):
+        for k, (a, b, _label) in enumerate(ranges):
             px[a:b] = [OUTPUT_COLORS[k % len(OUTPUT_COLORS)][1]] * (b - a)
         return px
 
     def one_output(k, secs):
-        a, b = ranges[k]
+        a, b, _label = ranges[k]
         name, color = OUTPUT_COLORS[k % len(OUTPUT_COLORS)]
         dim = tuple(c // 6 for c in color)
 
@@ -493,10 +496,10 @@ def run_chunks(dev, fps, order, proto_override, hold):
         s.hold(all_outputs, hold, fps)
         s.send(black)
         time.sleep(1.0)
-        for k, (a, b) in enumerate(ranges):
+        for k, (a, b, label) in enumerate(ranges):
             name = OUTPUT_COLORS[k % len(OUTPUT_COLORS)][0]
             print(
-                f"-- {time.strftime('%H:%M:%S')} output {k + 1} only, dim {name}; a white dot walks pixel {a + 1} -> {b} "
+                f"-- {time.strftime('%H:%M:%S')} {label} only, dim {name}; a white dot walks pixel {a + 1} -> {b} "
                 f"({hold:g} s)",
                 flush=True,
             )
