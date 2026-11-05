@@ -55,4 +55,17 @@ web:
   bind: 0.0.0.0
   port: 8080
 
+# Camera pixel mapping from your phone: http://<this box>:8080/map
+# The bridge blinks a code on a controller, you film it, the bridge decodes the
+# clip and exports a MADRIX / Resolume pixel map. All optional:
+# mapping:
+#   dir: /var/lib/twinkly-bridge/mapping   # default under systemd; ./mapping-data when run by hand
+#   keep_clips: false       # clips are deleted after a good decode; results are about 200 KB each
+#   min_free_mb: 500        # refuse uploads when the disk has less than this left
+#   max_upload_mb: 4000
+#   slot: 0.4               # seconds per code slot (longer = easier on the camera, slower scan)
+#   brightness: 96          # 1-255 for the lit pixels; lower if the camera blooms
+#   color: white            # white (W chip) | rgb | green
+#   passes: 10              # how often the code repeats per scan (about 18 s each)
+
 log_level: info             # debug | info | warning | error

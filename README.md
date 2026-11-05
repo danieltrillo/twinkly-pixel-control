@@ -201,6 +201,23 @@ Film the controller while it plays a blink code, and `tools/pixelmap.py` works
 out where every pixel is. It exports a fixture list for MADRIX 5 and an
 Advanced Output preset for Resolume Arena 7.
 
+**From your phone (the easy way).** Open `http://<bridge>:8080/map` on a phone
+that can reach the bridge box. Pick the controller, tap **Start scan** (the
+bridge takes over that controller and blinks the code for a few minutes), tap
+**Record a clip** or **Choose clips**, and upload. The bridge decodes each clip
+right away and shows a preview; with two or more clips from different angles,
+tap **Solve 3D**. Download the MADRIX CSV or Resolume XML from the same page;
+they use the controller's universe patch from the bridge config.
+
+Storage: a clip is deleted as soon as it is decoded (`mapping.keep_clips: true`
+keeps them); what stays is about 200 KB per clip (positions, preview, log) under
+`/var/lib/twinkly-bridge/mapping` (`mapping.dir`). Uploads are refused when the
+disk has less than `mapping.min_free_mb` (500 MB) left, and every clip has a
+delete button. Decoding needs numpy, OpenCV and scipy on the bridge box;
+`deploy/install.sh` installs them (`TWINKLY_BRIDGE_MAPPING=0` skips that).
+
+The rest of this section is the same thing by hand.
+
 **How the code works.** Each pixel blinks its own number: the Gray code of its
 index plus a 4-bit CRC, 15 bits for 1440 pixels. Every bit shows twice, as the
 bit and then its inverse, so the decoder compares each spot with itself and

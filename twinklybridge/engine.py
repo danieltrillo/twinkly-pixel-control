@@ -17,7 +17,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
-from . import __version__, artnet, sacn
+from . import __version__, artnet, mapcode, sacn
 from .config import ARTNET, SACN, Config, DeviceConfig, Segment, format_universe
 from .pixels import convert
 from .twinkly import AuthError, DeviceInfo, TwinklyClient, TwinklyError, build_packets, protocol_for_firmware
@@ -65,6 +65,84 @@ class RateCounter:
 
 
 # --------------------------------------------------------------------------
+# Camera mapping scan
+# --------------------------------------------------------------------------
+
+
+class ScanError(Exception):
+    """A mapping scan could not start. The message is user facing."""
+
+
+@dataclass
+class ScanJob:
+    """The camera-mapping blink code (mapcode.py), pre-rendered in the device's wire order.
+
+    While a scan runs the device shows these frames instead of its Art-Net input;
+    the input keeps landing in the buffer and takes over again when the scan ends.
+    """
+
+    frames: list[bytes]
+    slot: float
+    repeat: int
+    started: float
+    pixels: int
+    brightness: int
+    color: str
+    stopped: bool = False
+
+    @property
+    def pass_seconds(self) -> float:
+        return len(self.frames) * self.slot
+
+    @property
+    def total_seconds(self) -> float:
+        return self.pass_seconds * self.repeat
+
+    def elapsed(self, now: float) -> float:
+        return max(0.0, now - self.started)
+
+    def done(self, now: float) -> bool:
+        return self.stopped or self.elapsed(now) >= self.total_seconds
+
+    def frame_at(self, now: float) -> bytes:
+        return self.frames[int(self.elapsed(now) / self.slot) % len(self.frames)]
+
+    def status(self, now: float) -> dict:
+        t = self.elapsed(now)
+        return {
+            "pass": min(int(t / self.pass_seconds) + 1, self.repeat),
+            "passes": self.repeat,
+            "elapsed": round(t, 1),
+            "remaining": round(max(0.0, self.total_seconds - t), 1),
+            "pass_seconds": round(self.pass_seconds, 1),
+            "pixels": self.pixels,
+            "slot": self.slot,
+            "brightness": self.brightness,
+            "color": self.color,
+        }
+
+
+def render_scan_frames(pixels: int, order: str, brightness: int, color: str) -> list[bytes]:
+    """One wire-order frame per slot of the blink code."""
+    v = max(1, min(int(brightness), 255))
+    order = order.upper()
+    if color == "white" and "W" in order:
+        lit_rgbw = {"R": 0, "G": 0, "B": 0, "W": v}
+    elif color == "green":
+        lit_rgbw = {"R": 0, "G": v, "B": 0, "W": 0}
+    else:  # "rgb": white from the colour chips (also what "white" means on an RGB strand)
+        lit_rgbw = {"R": v, "G": v, "B": v, "W": 0}
+    lit = bytes(lit_rgbw[ch] for ch in order)
+    black = bytes(len(order))
+    words = [mapcode.codeword(i, pixels) for i in range(pixels)]
+    frames = []
+    for slot in mapcode.schedule(pixels):
+        mask = mapcode.lit_mask(slot, pixels, words)
+        frames.append(b"".join(lit if on else black for on in mask))
+    return frames
+
+
+# --------------------------------------------------------------------------
 # One Twinkly device
 # --------------------------------------------------------------------------
 
@@ -90,6 +168,7 @@ class DeviceRunner:
     tx: RateCounter = field(default_factory=RateCounter)
     send_errors: int = 0
     warnings: list[str] = field(default_factory=list)
+    scan: ScanJob | None = None
 
     def __post_init__(self) -> None:
         self.buffer = bytearray(self.cfg.pixels * self.cfg.channels)
@@ -123,9 +202,45 @@ class DeviceRunner:
         return self.ever_had_data and now - self.last_rx < self.cfg.loss_timeout
 
     def wants_rt(self, now: float) -> bool:
-        if self.has_data(now):
+        if self.scanning(now) or self.has_data(now):
             return True
         return self.ever_had_data and self.cfg.on_loss in ("hold", "black")
+
+    # -- camera mapping scan ---------------------------------------------------
+
+    def scanning(self, now: float) -> bool:
+        return self.scan is not None and not self.scan.done(now)
+
+    def start_scan(self, *, slot: float, brightness: int, color: str, repeat: int) -> ScanJob:
+        """Show the blink code on this device for `repeat` passes (replaces the input meanwhile)."""
+        if not self._ready or self.client is None or not self.order:
+            raise ScanError(f"{self.name} is {self.state}; it has to be online first")
+        if self.info is not None and self.info.group_mode == "slave":
+            raise ScanError(f"{self.name} is a group slave; take it out of its group in the Twinkly app first")
+        pixels = self.out_pixels
+        frames = render_scan_frames(pixels, self.order, brightness, color)
+        self.scan = ScanJob(
+            frames=frames,
+            slot=float(slot),
+            repeat=max(1, int(repeat)),
+            started=self.clock(),
+            pixels=pixels,
+            brightness=max(1, min(int(brightness), 255)),
+            color=color,
+        )
+        log.info(
+            "%s: mapping scan started, %d pixels, %d pass(es) of %.0f s",
+            self.name,
+            pixels,
+            self.scan.repeat,
+            self.scan.pass_seconds,
+        )
+        return self.scan
+
+    def stop_scan(self) -> None:
+        if self.scan is not None and not self.scan.stopped:
+            self.scan.stopped = True
+            log.info("%s: mapping scan stopped", self.name)
 
     # -- output --------------------------------------------------------------
 
@@ -145,10 +260,11 @@ class DeviceRunner:
             src = bytes(src[: n * ch]).ljust(n * ch, b"\x00")
         return bytes(convert(src, self.cfg.input, self.order, n))
 
-    def send_frame(self, now: float, black: bool = False) -> None:
+    def send_frame(self, now: float, black: bool = False, frame: bytes | None = None) -> None:
         if self.client is None or not self.client.token:
             return
-        frame = self.render(black)
+        if frame is None:
+            frame = self.render(black)
         ok = True
         for packet in build_packets(self.protocol, self.client.token, frame, self.out_pixels):
             if not self.sender(packet, (self.cfg.ip, self.cfg.rt_port)):
@@ -164,6 +280,13 @@ class DeviceRunner:
         """Called at cfg.fps. Sends a frame when there is something to send."""
         if not self._ready or not self.rt_armed:
             return
+        if self.scan is not None:
+            if not self.scan.done(now):
+                self.send_frame(now, frame=self.scan.frame_at(now))
+                return
+            log.info("%s: mapping scan finished", self.name)
+            self.scan = None
+            self.dirty = True  # show the input (or the held look) again right away
         if self.has_data(now):
             if self.dirty or now - self.last_send >= KEEPALIVE:
                 self.send_frame(now)
@@ -240,7 +363,9 @@ class DeviceRunner:
             if mode != "rt":
                 log.warning("%s: device left rt mode (now '%s'), switching back", self.name, mode)
                 await self.client.set_mode("rt")
-        if self.rt_armed:
+        if self.scanning(now) and self.rt_armed:
+            self.state = f"mapping scan (pass {self.scan.status(now)['pass']}/{self.scan.repeat})"
+        elif self.rt_armed:
             self.state = "streaming" if self.has_data(now) else f"no input ({self.cfg.on_loss})"
         else:
             self.state = "released" if self.ever_had_data else "ready, waiting for input"
@@ -336,6 +461,7 @@ class DeviceRunner:
             "rx": self.rx.to_dict(now),
             "tx": self.tx.to_dict(now),
             "send_errors": self.send_errors,
+            "scan": self.scan.status(now) if self.scanning(now) else None,
         }
 
 

@@ -1,9 +1,6 @@
 import csv
-import importlib.util
 import json
 import math
-import pathlib
-import sys
 import xml.etree.ElementTree as ET
 
 import pytest
@@ -12,12 +9,7 @@ np = pytest.importorskip("numpy")
 cv2 = pytest.importorskip("cv2")
 
 from twinklybridge import mapcode  # noqa: E402
-
-ROOT = pathlib.Path(__file__).resolve().parents[1]
-_spec = importlib.util.spec_from_file_location("pixelmap", ROOT / "tools" / "pixelmap.py")
-pixelmap = importlib.util.module_from_spec(_spec)
-sys.modules["pixelmap"] = pixelmap
-_spec.loader.exec_module(pixelmap)
+from twinklybridge import mapping as pixelmap  # noqa: E402
 
 
 def _render(points, lit, shape, sigma=1.5, level=200.0):
@@ -196,3 +188,11 @@ def test_synth_video_end_to_end(tmp_path):
     out = tmp_path / "out"
     pixelmap.main(["decode", video, "--pixels", "80", "--out", str(out)])
     assert pixelmap.main(["score", str(out / "map.json"), video + ".truth.json"]) == 0
+
+
+def test_solve3d_rejects_the_same_view_twice(tmp_path):
+    xyz, normals = _cone_tree(120)
+    paths = _orbit_views(tmp_path, xyz, normals, (0.3, 0.3))
+    with pytest.raises(SystemExit) as exc:
+        pixelmap.main(["solve3d", *paths, "--out", str(tmp_path / "3d")])
+    assert "different spots" in str(exc.value)

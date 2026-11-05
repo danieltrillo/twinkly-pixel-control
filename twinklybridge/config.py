@@ -104,11 +104,30 @@ class WebConfig:
     port: int = 8080
 
 
+MAP_COLORS = ("white", "rgb", "green")
+
+
+@dataclass
+class MappingConfig:
+    """Camera pixel mapping from the web page (/map)."""
+
+    dir: str = ""  # clips and results; "" = $STATE_DIRECTORY/mapping under systemd, else ./mapping-data
+    keep_clips: bool = False  # keep uploaded videos after a good decode (results are tiny, clips are not)
+    min_free_mb: int = 500  # refuse uploads when the disk has less than this left
+    max_upload_mb: int = 4000
+    slot: float = 0.4  # seconds per code slot
+    brightness: int = 96  # 1-255 for the lit pixels
+    color: str = "white"  # white (W chip) | rgb | green
+    passes: int = 10  # how often the code repeats per scan (about 18 s each)
+    decode_width: int = 1280  # decode videos at this width
+
+
 @dataclass
 class Config:
     input: InputConfig
     devices: list[DeviceConfig]
     web: WebConfig = field(default_factory=WebConfig)
+    mapping: MappingConfig = field(default_factory=MappingConfig)
     log_level: str = "info"
 
     @property
@@ -367,9 +386,22 @@ def _parse_device(index: int, raw: Any, defaults: dict, inp: InputConfig) -> Dev
     return device
 
 
+MAPPING_KEYS = {
+    "dir",
+    "keep_clips",
+    "min_free_mb",
+    "max_upload_mb",
+    "slot",
+    "brightness",
+    "color",
+    "passes",
+    "decode_width",
+}
+
+
 def parse_config(raw: Any) -> Config:
     top = _mapping(raw, "config")
-    _unknown_keys(top, {"input", "defaults", "devices", "web", "log_level"}, "config")
+    _unknown_keys(top, {"input", "defaults", "devices", "web", "mapping", "log_level"}, "config")
     inp = _parse_input(top.get("input"))
 
     defaults = _mapping(top.get("defaults"), "defaults")
@@ -399,10 +431,24 @@ def parse_config(raw: Any) -> Config:
         bind=_str(web_raw.get("bind"), "web.bind", "0.0.0.0").strip() or "0.0.0.0",
         port=_int(web_raw.get("port"), "web.port", 8080, 1, 65535),
     )
+    map_raw = _mapping(top.get("mapping"), "mapping")
+    _unknown_keys(map_raw, MAPPING_KEYS, "mapping")
+    mapping = MappingConfig(
+        dir=_str(map_raw.get("dir"), "mapping.dir", "").strip(),
+        keep_clips=_bool(map_raw.get("keep_clips"), "mapping.keep_clips", False),
+        min_free_mb=_int(map_raw.get("min_free_mb"), "mapping.min_free_mb", 500, 0, 1_000_000),
+        max_upload_mb=_int(map_raw.get("max_upload_mb"), "mapping.max_upload_mb", 4000, 1, 100_000),
+        slot=_float(map_raw.get("slot"), "mapping.slot", 0.4, 0.1, 2.0),
+        brightness=_int(map_raw.get("brightness"), "mapping.brightness", 96, 1, 255),
+        color=_choice(map_raw.get("color"), "mapping.color", MAP_COLORS, "white"),
+        passes=_int(map_raw.get("passes"), "mapping.passes", 10, 1, 100),
+        decode_width=_int(map_raw.get("decode_width"), "mapping.decode_width", 1280, 320, 4096),
+    )
     return Config(
         input=inp,
         devices=devices,
         web=web,
+        mapping=mapping,
         log_level=_choice(top.get("log_level"), "log_level", LOG_LEVELS, "info"),
     )
 

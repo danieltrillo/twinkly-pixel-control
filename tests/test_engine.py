@@ -363,3 +363,60 @@ def test_rejected_token_backs_off_instead_of_spinning(fast):
             await fake.stop()
 
     run(scenario())
+
+
+# -- camera mapping scan ------------------------------------------------------
+
+
+def test_mapping_scan_replaces_the_input_then_hands_back():
+    from types import SimpleNamespace
+
+    from twinklybridge import mapcode
+    from twinklybridge.twinkly import DeviceInfo
+
+    cfg = make_config([{"name": "T", "ip": "10.0.0.1", "universe": "0.0.0", "pixels": 8}])
+    sent = []
+    eng = Engine(cfg, sender=lambda p, a: sent.append(p) or True, hostname="box")
+    dev = eng.devices[0]
+    now = [100.0]
+    dev.clock = lambda: now[0]
+    with pytest.raises(engine_mod.ScanError):
+        dev.start_scan(slot=0.4, brightness=50, color="white", repeat=1)  # not connected yet
+
+    # as if connect() had run against an 8 pixel RGBW controller
+    dev.order, dev.info, dev._ready, dev.state = "WRGB", DeviceInfo(led_profile="RGBW", number_of_led=8), True, "ready"
+    dev.client = SimpleNamespace(token=b"\x01" * 8)
+    job = dev.start_scan(slot=0.4, brightness=50, color="white", repeat=1)
+    assert dev.scanning(now[0]) and dev.wants_rt(now[0]) and not dev.ever_had_data
+    assert job.pixels == 8 and job.pass_seconds == len(mapcode.schedule(8)) * 0.4
+    dev.rt_armed = True
+
+    def pixels():
+        return sent[-1][12:]  # protocol v3 header is 12 bytes
+
+    dev.frame_step(now[0])  # a lead slot: everything off
+    assert pixels() == bytes(8 * 4)
+    now[0] = 100.0 + mapcode.LEAD * 0.4 + 0.1  # first mark: every pixel on, W chip only
+    dev.frame_step(now[0])
+    assert pixels()[0::4] == bytes([50] * 8) and pixels()[1::4] == bytes(8)
+    first_data = mapcode.LEAD + mapcode.MARK + 1
+    now[0] = 100.0 + first_data * 0.4 + 0.1  # bit 0, phase 1
+    dev.frame_step(now[0])
+    for i in range(8):
+        assert (pixels()[4 * i] == 50) == bool(mapcode.codeword(i, 8) & 1)
+    assert dev.status(now[0])["scan"]["pass"] == 1
+
+    now[0] = 100.0 + job.total_seconds + 0.01
+    dev.frame_step(now[0])
+    assert dev.scan is None and not dev.wants_rt(now[0])  # never had input: hands back
+    assert dev.status(now[0])["scan"] is None
+
+    # input arriving during a scan is remembered and shown once the scan is over
+    dev.start_scan(slot=0.4, brightness=50, color="rgb", repeat=1)
+    eng.handle_artnet(artnet.encode_dmx(0, bytes([9, 8, 7, 6] * 8)), "2.0.0.1")
+    dev.frame_step(now[0])
+    assert pixels() == bytes(8 * 4)  # lead slot of the new scan, not the Art-Net look
+    dev.stop_scan()
+    assert not dev.scanning(now[0]) and dev.wants_rt(now[0])
+    dev.frame_step(now[0])
+    assert dev.scan is None and pixels()[:4] == bytes([6, 9, 8, 7])  # WRGB of the console's RGBW

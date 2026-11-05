@@ -1,0 +1,331 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pixel mapping · Twinkly Bridge</title>
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --text:#1c1e21; --muted:#6b7280; --line:#e5e7eb;
+          --ok:#15803d; --warn:#b45309; --bad:#b91c1c; --accent:#2563eb; --accent-text:#fff; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#111317; --card:#1a1d23; --text:#e8eaed; --muted:#9aa0a6; --line:#2a2e36;
+            --ok:#4ade80; --warn:#fbbf24; --bad:#f87171; --accent:#3b82f6; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:16px/1.45 system-ui, -apple-system, Segoe UI, sans-serif; }
+  header { display:flex; flex-wrap:wrap; gap:10px; align-items:baseline; padding:14px 16px 4px; }
+  h1 { font-size:18px; margin:0; }
+  header a { color:var(--muted); font-size:14px; }
+  main { padding:8px 16px 40px; display:grid; gap:14px; max-width:720px; margin:0 auto; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:14px; }
+  .card h2 { font-size:15px; margin:0 0 8px; }
+  .muted { color:var(--muted); } .small { font-size:13px; }
+  .ok { color:var(--ok); } .warn { color:var(--warn); } .bad { color:var(--bad); }
+  .row { display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
+  select, input[type=text], input[type=number] { font:inherit; padding:8px 10px; border-radius:8px; border:1px solid var(--line); background:var(--bg); color:var(--text); }
+  select { width:100%; }
+  input[type=number] { width:88px; }
+  button { font:inherit; padding:10px 14px; border-radius:10px; border:1px solid var(--line); background:var(--card); color:var(--text); cursor:pointer; }
+  button.primary { background:var(--accent); color:var(--accent-text); border-color:var(--accent); font-weight:600; }
+  button.big { font-size:17px; padding:14px 18px; flex:1; min-width:160px; }
+  button:disabled { opacity:.45; cursor:default; }
+  .bar { height:8px; background:var(--line); border-radius:4px; overflow:hidden; margin-top:8px; }
+  .bar div { height:100%; background:var(--accent); width:0; transition:width .3s; }
+  .job { display:flex; gap:10px; padding:10px 0; border-top:1px solid var(--line); align-items:flex-start; }
+  .job img { width:96px; height:54px; object-fit:cover; border-radius:6px; background:#000; flex:none; }
+  .job .body { flex:1; min-width:0; }
+  .job .body div { overflow-wrap:anywhere; }
+  .job button { padding:6px 10px; font-size:13px; }
+  .banner { background:var(--bad); color:#fff; padding:10px 12px; border-radius:10px; }
+  .banner.warn { background:var(--warn); }
+  details summary { cursor:pointer; color:var(--muted); font-size:14px; }
+  label.f { display:inline-flex; flex-direction:column; gap:2px; font-size:13px; color:var(--muted); }
+  a.dl { display:inline-block; padding:10px 14px; border:1px solid var(--line); border-radius:10px; color:inherit; text-decoration:none; }
+  .preview3d { width:100%; border-radius:8px; margin-top:8px; }
+  ol { padding-left:20px; margin:6px 0; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Pixel mapping</h1>
+  <span style="flex:1"></span>
+  <a href="./">bridge status</a>
+</header>
+<main>
+  <div id="banner"></div>
+
+  <section class="card">
+    <h2>1. Controller</h2>
+    <select id="device"></select>
+    <div class="small muted" id="devstate" style="margin-top:6px"></div>
+  </section>
+
+  <section class="card">
+    <h2>2. Blink the code</h2>
+    <div class="row">
+      <button class="primary big" id="start">Start scan</button>
+      <button class="big" id="stop" hidden>Stop scan</button>
+    </div>
+    <div id="scanstate" class="small muted" style="margin-top:8px">The bridge takes over this controller and blinks every pixel's number. Start it, then record.</div>
+    <details style="margin-top:8px"><summary>Scan settings</summary>
+      <div class="row" style="margin-top:8px">
+        <label class="f">passes <input type="number" id="passes" min="1" max="100"></label>
+        <label class="f">brightness <input type="number" id="brightness" min="1" max="255"></label>
+        <label class="f">slot (s) <input type="number" id="slot" min="0.1" max="2" step="0.1"></label>
+        <label class="f">colour <select id="color" style="width:auto"><option>white</option><option>rgb</option><option>green</option></select></label>
+      </div>
+    </details>
+  </section>
+
+  <section class="card">
+    <h2>3. Film it, then upload</h2>
+    <details><summary>How to film (tap)</summary>
+      <ol class="small">
+        <li>Phone on a tripod, whole rig in frame, room as dark as you can.</li>
+        <li>Lock exposure and focus (long-press the preview in the camera app).</li>
+        <li>Record at least one full pass: both white flashes, about 20 s.</li>
+        <li>For 3D: 6–8 spots around the rig, about 45° apart, one clip each.</li>
+      </ol>
+    </details>
+    <div class="row" style="margin-top:8px">
+      <input type="text" id="label" placeholder="label, e.g. front / left / back" style="flex:1; min-width:160px">
+    </div>
+    <div class="row" style="margin-top:8px">
+      <button class="primary big" id="record">📷 Record a clip</button>
+      <button class="big" id="choose">📁 Choose clips</button>
+    </div>
+    <input type="file" id="rec" accept="video/*" capture="environment" hidden>
+    <input type="file" id="pick" accept="video/*" multiple hidden>
+    <div id="upmsg" class="small muted" style="margin-top:8px"></div>
+    <div class="bar" id="upbar" hidden><div></div></div>
+  </section>
+
+  <section class="card">
+    <h2>4. Clips</h2>
+    <div id="jobs" class="small muted">No clips yet.</div>
+  </section>
+
+  <section class="card">
+    <h2>5. 3D</h2>
+    <div class="row">
+      <button class="primary" id="solve">Solve 3D</button>
+      <label class="f">lens FOV° (blank = find it) <input type="number" id="fov" min="20" max="150" placeholder="auto"></label>
+    </div>
+    <div id="solvestate" class="small muted" style="margin-top:8px"></div>
+    <img id="solveimg" class="preview3d" hidden alt="3D preview">
+  </section>
+
+  <section class="card">
+    <h2>6. Export</h2>
+    <select id="source"></select>
+    <div class="row" style="margin-top:8px" id="exports"></div>
+    <div class="small muted" style="margin-top:8px">MADRIX 5: Patch Editor → File → Import Fixture List (comma, header line on). Resolume Arena 7: drop the XML in the Advanced Output presets folder (preset menu → Reveal), then load it.</div>
+  </section>
+
+  <section class="card">
+    <h2>Storage</h2>
+    <div id="storage" class="small muted"></div>
+  </section>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const mmss = (s) => `${Math.floor(s / 60)}:${String(Math.round(s % 60)).padStart(2, "0")}`;
+const when = (t) => new Date(t * 1000).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+let state = null;
+let device = localStorage.getItem("mapDevice") || "";
+let settingsFilled = false;
+let busy = false;
+
+async function post(url, body) {
+  const r = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  const j = await r.json().catch(() => ({ ok: false, error: `HTTP ${r.status}` }));
+  if (!r.ok || !j.ok) throw new Error(j.error || `HTTP ${r.status}`);
+  return j;
+}
+
+async function refresh() {
+  try {
+    state = await (await fetch("api/map/state")).json();
+  } catch (e) {
+    $("banner").innerHTML = `<div class="banner">Lost contact with the bridge</div>`;
+    return;
+  }
+  render();
+}
+
+function currentDevice() {
+  return (state.devices || []).find((d) => d.name === device) || null;
+}
+
+function render() {
+  const s = state;
+  let banner = "";
+  if (s.missing) banner = `<div class="banner">Decoding needs <b>${esc(s.missing)}</b> on the bridge box: ${esc(s.install_hint)}</div>`;
+  else if (!s.devices.length) banner = `<div class="banner warn">No controllers: the bridge is not running or the config has no devices.</div>`;
+  $("banner").innerHTML = banner;
+
+  const sel = $("device");
+  const names = s.devices.map((d) => d.name);
+  if (!names.includes(device)) device = names[0] || "";
+  if (sel.dataset.names !== names.join("\n")) {
+    sel.innerHTML = s.devices.map((d) => `<option value="${esc(d.name)}">${esc(d.name)} · ${esc(d.ip)}</option>`).join("");
+    sel.dataset.names = names.join("\n");
+  }
+  sel.value = device;
+  const d = currentDevice();
+  if (d) {
+    const cls = d.ready ? "ok" : "bad";
+    const warn = d.warnings.length ? ` <span class="warn">${esc(d.warnings.join("; "))}</span>` : "";
+    $("devstate").innerHTML = `<span class="${cls}">${esc(d.state)}</span> · ${d.pixels} pixels${warn}${d.error ? ` <span class="bad">${esc(d.error)}</span>` : ""}`;
+  } else {
+    $("devstate").textContent = "";
+  }
+
+  if (!settingsFilled && s.settings) {
+    $("passes").value = s.settings.passes; $("brightness").value = s.settings.brightness;
+    $("slot").value = s.settings.slot; $("color").value = s.settings.color;
+    settingsFilled = true;
+  }
+  const scan = d && d.scan;
+  $("start").hidden = !!scan;
+  $("stop").hidden = !scan;
+  $("start").disabled = !d || !d.ready || busy;
+  if (scan) {
+    const pct = Math.round(100 * scan.elapsed / (scan.elapsed + scan.remaining));
+    $("scanstate").innerHTML = `<span class="ok">Scanning</span> pass ${scan.pass}/${scan.passes} · ${mmss(scan.remaining)} left · ${scan.pixels} px, ${scan.pass_seconds} s per pass<div class="bar"><div style="width:${pct}%"></div></div>`;
+  } else if (!$("scanstate").dataset.msg) {
+    $("scanstate").innerHTML = `The bridge takes over this controller and blinks every pixel's number. Start it, then record.`;
+  }
+
+  const jobs = (s.jobs || []).filter((j) => j.device === device);
+  const clips = jobs.filter((j) => j.type === "decode").slice().reverse();
+  const solve = jobs.find((j) => j.type === "solve");
+  $("jobs").innerHTML = clips.length ? clips.map(jobHtml).join("") : `<span class="muted">No clips yet for this controller.</span>`;
+
+  const done = clips.filter((j) => j.status === "done");
+  $("solve").disabled = done.length < 2 || busy || (solve && (solve.status === "queued" || solve.status === "running"));
+  if (solve && solve.status === "done" && solve.result) {
+    const r = solve.result;
+    $("solvestate").innerHTML = `<span class="ok">Solved</span> ${r.found} of ${r.found + r.missing} pixels from ${r.views}/${r.clips} clips · lens ${r.fov}° · fit ${r.median_error_px} px <span class="muted">(${when(solve.updated)})</span>`;
+    $("solveimg").hidden = false;
+    const src = `api/map/jobs/${encodeURIComponent(solve.slug)}/solve/preview.png?t=${Math.round(solve.updated)}`;
+    if ($("solveimg").dataset.src !== src) { $("solveimg").src = src; $("solveimg").dataset.src = src; }
+  } else if (solve && (solve.status === "queued" || solve.status === "running")) {
+    $("solvestate").innerHTML = `<span class="warn">Solving…</span> this takes a minute`;
+    $("solveimg").hidden = true;
+  } else if (solve && solve.status === "failed") {
+    $("solvestate").innerHTML = `<span class="bad">Failed:</span> ${esc(solve.error)}`;
+    $("solveimg").hidden = true;
+  } else {
+    $("solvestate").innerHTML = done.length < 2 ? `Decode at least two clips from different angles first (${done.length} so far).` : `${done.length} decoded clips ready.`;
+    $("solveimg").hidden = true;
+  }
+
+  const srcSel = $("source");
+  const options = [];
+  if (solve && solve.status === "done") options.push({ v: "solve", t: `3D solve (${solve.result.found} px)` });
+  for (const j of done) options.push({ v: j.id, t: `${j.label || "clip"} · ${when(j.created)} (${j.result.found} px, 2D)` });
+  const key = options.map((o) => o.v).join("|");
+  if (srcSel.dataset.key !== key) {
+    const prev = srcSel.value;
+    srcSel.innerHTML = options.map((o) => `<option value="${esc(o.v)}">${esc(o.t)}</option>`).join("") || `<option value="">nothing decoded yet</option>`;
+    srcSel.dataset.key = key;
+    if (options.some((o) => o.v === prev)) srcSel.value = prev;
+  }
+  const slug = (clips[0] || solve || {}).slug;
+  const src = srcSel.value;
+  $("exports").innerHTML = src && slug ? [["madrix.csv", "MADRIX CSV"], ["resolume.xml", "Resolume XML"], ["map.csv", "positions CSV"], ["map.json", "map.json"]]
+    .map(([k, t]) => `<a class="dl" href="api/map/export/${encodeURIComponent(slug)}/${encodeURIComponent(src)}/${k}" download>${t}</a>`).join("") : "";
+
+  const disk = s.disk || {};
+  $("storage").innerHTML = `${disk.used_mb} MB used by mapping · ${disk.free_mb} MB free on disk (uploads stop at ${disk.min_free_mb} MB) · clips are ${s.settings.keep_clips ? "kept" : "deleted after decoding"} · ${esc(disk.dir)}`;
+}
+
+function jobHtml(j) {
+  const img = j.files.includes("preview.png") ? `<a href="api/map/jobs/${encodeURIComponent(j.slug)}/${j.id}/preview.png" target="_blank"><img src="api/map/jobs/${encodeURIComponent(j.slug)}/${j.id}/preview.png" alt=""></a>` : `<div style="width:96px;height:54px;flex:none"></div>`;
+  let line;
+  if (j.status === "done") {
+    const r = j.result;
+    line = `<span class="ok">${r.found}/${r.found + r.missing} pixels</span>${r.mirrored ? `, ${r.mirrored} on a mirrored strand` : ""} · ${r.passes} pass${r.passes === 1 ? "" : "es"} · ${j.seconds}s`;
+  } else if (j.status === "failed") {
+    line = `<span class="bad">Failed:</span> ${esc(j.error)}`;
+  } else if (j.status === "running") {
+    line = `<span class="warn">Decoding…</span> ${Math.round((Date.now() / 1000) - (j.started || j.updated))}s`;
+  } else {
+    line = `<span class="muted">${esc(j.status)}</span>`;
+  }
+  const size = j.clip ? ` · ${(j.clip.bytes / 1048576).toFixed(0)} MB${j.clip.kept ? "" : " (clip deleted)"}` : "";
+  const logLink = j.files.includes("log.txt") ? ` · <a href="api/map/jobs/${encodeURIComponent(j.slug)}/${j.id}/log.txt" target="_blank">log</a>` : "";
+  return `<div class="job">${img}<div class="body"><div><b>${esc(j.label || "clip")}</b> <span class="muted">${when(j.created)} · ${j.pixels} px${size}</span></div><div>${line}${logLink}</div></div><button data-del="${esc(j.slug)}/${j.id}">✕</button></div>`;
+}
+
+$("device").onchange = () => { device = $("device").value; localStorage.setItem("mapDevice", device); render(); };
+$("source").onchange = render;
+
+$("start").onclick = async () => {
+  busy = true; $("start").disabled = true;
+  try {
+    await post("api/map/scan", { device, passes: +$("passes").value, brightness: +$("brightness").value, slot: +$("slot").value, color: $("color").value });
+    $("scanstate").dataset.msg = "";
+  } catch (e) { alert(e.message); }
+  busy = false; refresh();
+};
+$("stop").onclick = async () => { try { await post("api/map/scan/stop", { device }); } catch (e) { alert(e.message); } refresh(); };
+
+$("record").onclick = () => $("rec").click();
+$("choose").onclick = () => $("pick").click();
+$("rec").onchange = () => uploadAll($("rec").files);
+$("pick").onchange = () => uploadAll($("pick").files);
+
+async function uploadAll(files) {
+  const list = Array.from(files || []);
+  for (let i = 0; i < list.length; i++) {
+    const suffix = list.length > 1 ? ` ${i + 1}` : "";
+    await upload(list[i], ($("label").value.trim() + suffix).trim());
+  }
+  $("rec").value = ""; $("pick").value = "";
+  refresh();
+}
+
+function upload(file, label) {
+  return new Promise((resolve) => {
+    const fd = new FormData();
+    fd.append("device", device);
+    fd.append("label", label);
+    fd.append("clip", file, file.name || "clip.mp4");
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", "api/map/upload");
+    $("upbar").hidden = false; $("upbar").firstElementChild.style.width = "0";
+    $("upmsg").innerHTML = `Uploading ${esc(file.name || "clip")} (${(file.size / 1048576).toFixed(0)} MB)…`;
+    xhr.upload.onprogress = (e) => { if (e.lengthComputable) $("upbar").firstElementChild.style.width = `${Math.round(100 * e.loaded / e.total)}%`; };
+    xhr.onload = () => {
+      $("upbar").hidden = true;
+      let j = {}; try { j = JSON.parse(xhr.responseText); } catch (e) {}
+      $("upmsg").innerHTML = xhr.status === 200 && j.ok ? `<span class="ok">Uploaded.</span> Decoding takes a minute or two; it shows up below.` : `<span class="bad">${esc(j.error || `HTTP ${xhr.status}`)}</span>`;
+      resolve();
+    };
+    xhr.onerror = () => { $("upbar").hidden = true; $("upmsg").innerHTML = `<span class="bad">Upload failed (network)</span>`; resolve(); };
+    xhr.send(fd);
+  });
+}
+
+$("jobs").onclick = async (e) => {
+  const key = e.target.dataset && e.target.dataset.del;
+  if (!key) return;
+  if (!confirm("Delete this clip and its results?")) return;
+  await fetch(`api/map/jobs/${key}`, { method: "DELETE" });
+  refresh();
+};
+
+$("solve").onclick = async () => {
+  busy = true; $("solve").disabled = true;
+  try { await post("api/map/solve", { device, fov: $("fov").value ? +$("fov").value : null }); } catch (e) { alert(e.message); }
+  busy = false; refresh();
+};
+
+refresh();
+setInterval(refresh, 2000);
+</script>
+</body>
+</html>
