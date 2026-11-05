@@ -426,11 +426,17 @@ OUTPUT_COLORS = [
 def output_ranges(dev, g, n):
     """Pixel ranges per physical output, as (first, end) 0-based half-open, in output order."""
     ranges = []
-    for port in device_config(g).get("ports", []):  # Pro v2: start is 1-based
+    offset = 0
+    for port in device_config(g).get("ports", []):
+        # Pro v2: each port's strings start at 1 again (start is 1-based *within the port*);
+        # the frame itself runs port by port, so lay the ports out one after another.
+        port_len = 0
         for st in port.get("strings", []):
-            start, length = int(st.get("start", 1)), int(st.get("len", 0))
+            start, length = max(int(st.get("start", 1)) - 1, 0), int(st.get("len", 0))
             if length > 0:
-                ranges.append((max(start - 1, 0), max(start - 1, 0) + length))
+                ranges.append((offset + start, offset + start + length))
+                port_len = max(port_len, start + length)
+        offset += port_len
     if not ranges and dev.api == "v1":
         try:
             for st in dev.get("/led/config").get("strings", []):
