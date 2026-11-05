@@ -11,7 +11,8 @@ Python 3.8+ standard library only. No installs needed.
 
 Usage:
   python3 twinkly_probe.py info  <controller-ip>
-  python3 twinkly_probe.py test  <controller-ip> [--fps 40] [--order WRGB]
+  python3 twinkly_probe.py test  <controller-ip> [--fps 40] [--order WRGB] [--yes --hold 6]
+  python3 twinkly_probe.py locate <controller-ip> [--seconds 60] [--hz 4] [--width 1] [--which both]
 
 Reference: https://xled-docs.readthedocs.io/en/latest/protocol_details.html
 """
@@ -408,10 +409,58 @@ def run_test(dev, fps, order, proto_override, auto_yes, hold=3.0):
         print(f"  {k:<14}: {v}")
 
 
+# ------------------------------------------------------------------- locate --
+def run_locate(dev, fps, order, proto_override, seconds, hz, width, which):
+    """Strobe the first pixel(s) red and the last pixel(s) blue so you can find the ends of the run."""
+    fw, g = show_info(dev)
+    n = int(g.get("number_of_led", 0))
+    profile = profile_of(g)
+    if n <= 0:
+        sys.exit("Controller reports 0 LEDs - check it in the Twinkly app.")
+    if group_of(g)[0] == "slave":
+        sys.exit("Controller is a group slave; Pro firmware refuses realtime. Take it out of its group first.")
+    proto = proto_override or pick_protocol(fw)
+    s = Streamer(dev, n, profile, proto, order)
+    width = max(1, min(int(width), n))
+    black = [(0, 0, 0, 0)] * n
+    parts = []
+    if which in ("first", "both"):
+        parts.append(f"first {width} px RED (pixel 1, controller end of the first output)")
+    if which in ("last", "both"):
+        parts.append(f"last {width} px BLUE (pixel {n}, far end of the last output)")
+    print(
+        f"\n-- {time.strftime('%H:%M:%S')} locate: {' and '.join(parts)}, strobing {hz:g} Hz for {seconds:g} s",
+        flush=True,
+    )
+
+    def pixels(t):
+        px = list(black)
+        if int(t * hz * 2) % 2 == 0:  # on half the time
+            if which in ("first", "both"):
+                px[:width] = [(255, 0, 0, 0)] * width
+            if which in ("last", "both"):
+                px[n - width :] = [(0, 0, 255, 0)] * width
+        return px
+
+    prev_mode = dev.get_mode() or "movie"
+    try:
+        dev.set_mode("rt")
+        s.hold(pixels, seconds, fps)
+        s.send(black)
+    except KeyboardInterrupt:
+        print("\n  stopped early")
+    finally:
+        try:
+            dev.set_mode(prev_mode)
+            print(f"\n  restored mode: {prev_mode}")
+        except RuntimeError as e:
+            print(f"\n  couldn't restore mode ({e}) - pick a movie in the app")
+
+
 # --------------------------------------------------------------------- main --
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("command", choices=["info", "test"])
+    ap.add_argument("command", choices=["info", "test", "locate"])
     ap.add_argument("ip")
     ap.add_argument("--fps", type=float, default=40, help="frames per second to send (default 40)")
     ap.add_argument(
@@ -430,12 +479,18 @@ def main():
     ap.add_argument("--udp-port", type=int, default=UDP_PORT, help=argparse.SUPPRESS)
     ap.add_argument("--yes", action="store_true", help="don't ask after each step; just run the sequence")
     ap.add_argument("--hold", type=float, default=3, help="seconds to hold each colour/pixel step (default 3)")
+    ap.add_argument("--seconds", type=float, default=60, help="locate: how long to strobe (default 60)")
+    ap.add_argument("--hz", type=float, default=4, help="locate: strobe rate (default 4)")
+    ap.add_argument("--width", type=int, default=1, help="locate: how many pixels at each end (default 1)")
+    ap.add_argument("--which", choices=["first", "last", "both"], default="both", help="locate: which end(s)")
     a = ap.parse_args()
 
     dev = Twinkly(a.ip, a.http_port, a.udp_port)
     try:
         if a.command == "info":
             show_info(dev)
+        elif a.command == "locate":
+            run_locate(dev, a.fps, a.order, a.proto, a.seconds, a.hz, a.width, a.which)
         else:
             run_test(dev, a.fps, a.order, a.proto, a.yes, a.hold)
     except RuntimeError as e:
