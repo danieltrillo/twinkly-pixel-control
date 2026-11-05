@@ -276,24 +276,43 @@ class TwinklyClient:
         self.api = ""
         raise TwinklyError(f"{self.ip} answers HTTP but has no /xled/v1 or /xled/v2 gestalt; is it a Twinkly?")
 
+    # Endpoint names that differ between the two API generations. v2 (Pro
+    # firmware 4.x) was verified on a TWPROCTRLPLC21; the names come from
+    # the ttls library and from probing the device.
+    @property
+    def _mode_path(self) -> str:
+        return "/application/mode" if self.api == "v2" else "/led/mode"
+
+    @property
+    def _fw_path(self) -> str:
+        return "/fw/ct1/version" if self.api == "v2" else "/fw/version"
+
     async def info(self) -> DeviceInfo:
         gestalt = await self.detect()
         try:
-            fw = (await self._request("GET", "/fw/version", auth=False)).get("version", "")
+            fw = (await self._request("GET", self._fw_path, auth=False)).get("version", "")
         except NotFound:
-            fw = ""  # newer Pro firmware has no fw/version endpoint
+            fw = ""
         return DeviceInfo.from_api(gestalt, fw, self.api)
 
     async def get_mode(self) -> str:
         """Current LED mode, or "" when the firmware doesn't expose it."""
         try:
-            reply = await self._request("GET", "/led/mode")
+            reply = await self._request("GET", self._mode_path)
         except NotFound:
             return ""
         return str(reply.get("mode", ""))
 
     async def set_mode(self, mode: str) -> None:
-        reply = await self._request("POST", "/led/mode", {"mode": mode})
+        try:
+            reply = await self._request("POST", self._mode_path, {"mode": mode})
+        except TwinklyError as exc:
+            if "HTTP 403" in str(exc):
+                raise TwinklyError(
+                    f"set mode {mode!r} refused (403). On Pro firmware this means the controller is a group "
+                    "slave; take it out of its group in the Twinkly Pro app"
+                ) from None
+            raise
         if result_code(reply) != CODE_OK:
             raise TwinklyError(f"set mode {mode!r} refused: {reply}")
 

@@ -25,8 +25,21 @@ import time
 import urllib.error
 import urllib.request
 
-FULL_GETS = ["summary", "status", "movies", "movies/current", "playlists", "led/color", "led/out/brightness",
-             "led/out/hue", "mqtt/config", "artnet/config", "osc", "device/config", "gestalt"]
+FULL_GETS = [
+    "summary",
+    "status",
+    "movies",
+    "movies/current",
+    "playlists",
+    "led/color",
+    "led/out/brightness",
+    "led/out/hue",
+    "mqtt/config",
+    "artnet/config",
+    "osc",
+    "device/config",
+    "gestalt",
+]
 
 POST_EMPTY = """
 app_mode led/app_mode app/mode app device/mode device/app_mode mode
@@ -97,8 +110,10 @@ def short(b: bytes, n: int = 160) -> str:
 
 def mask(obj):
     if isinstance(obj, dict):
-        return {k: ("***" if any(w in k.lower() for w in SECRET_WORDS) and isinstance(v, (str, int)) else mask(v))
-                for k, v in obj.items()}
+        return {
+            k: ("***" if any(w in k.lower() for w in SECRET_WORDS) and isinstance(v, (str, int)) else mask(v))
+            for k, v in obj.items()
+        }
     if isinstance(obj, list):
         return [mask(x) for x in obj]
     return obj
@@ -161,8 +176,17 @@ def part_b(h: Http) -> None:
     print(f"  POST led/rt/frame (16 B) -> {st}; headers: {json.dumps(hdr)}; body: {short(body)}")
 
 
-def rt_frame(h: Http, label: str, body: bytes, *, path="led/rt/frame", ctype="application/octet-stream",
-             method="POST", auth=True, headers=None) -> int:
+def rt_frame(
+    h: Http,
+    label: str,
+    body: bytes,
+    *,
+    path="led/rt/frame",
+    ctype="application/octet-stream",
+    method="POST",
+    auth=True,
+    headers=None,
+) -> int:
     t0 = time.perf_counter()
     st, hdr, out = h.v2(method, path, body, auth=auth, ctype=ctype, headers=headers)
     ms = (time.perf_counter() - t0) * 1000
@@ -229,8 +253,14 @@ def part_d(h: Http, a: dict) -> None:
     rt_frame(h, "3 B/LED", bytes([0, 8, 0]) * n)
     for q in ("?frame=0", "?seq=0", f"?offset={goff}", f"?start={goff}&len={n}", "?id=0", "?index=0"):
         rt_frame(h, f"full + query {q}", full, path="led/rt/frame" + q)
-    for ct in ("application/binary", "application/x-binary", "*/*", "application/x-www-form-urlencoded",
-               "text/plain", "image/raw"):
+    for ct in (
+        "application/binary",
+        "application/x-binary",
+        "*/*",
+        "application/x-www-form-urlencoded",
+        "text/plain",
+        "image/raw",
+    ):
         rt_frame(h, f"full, Content-Type {ct}", full, ctype=ct)
     rt_frame(h, "PUT full", full, method="PUT")
     rt_frame(h, "PATCH full", full, method="PATCH")
@@ -243,8 +273,11 @@ def part_d(h: Http, a: dict) -> None:
     rt_frame(h, "POST json {} to led/rt/frame", {})
     rt_frame(h, 'POST json {"frame": base64}', {"frame": base64.b64encode(full).decode()})
     rt_frame(h, 'POST json {"data": base64, "offset": 0}', {"data": base64.b64encode(full).decode(), "offset": 0})
-    rt_frame(h, "POST json movie-like {frames:1, leds:n, data: base64}",
-             {"frames_number": 1, "leds_per_frame": n, "frame_data": base64.b64encode(full).decode()})
+    rt_frame(
+        h,
+        "POST json movie-like {frames:1, leds:n, data: base64}",
+        {"frames_number": 1, "leds_per_frame": n, "frame_data": base64.b64encode(full).decode()},
+    )
 
 
 def part_e(h: Http) -> None:
@@ -255,8 +288,10 @@ def part_e(h: Http) -> None:
         if st != 404:
             hits += 1
             allow = hdr.get("Allow") or hdr.get("allow") or ""
-            print(f"  {st:>3}  POST /xled/v2/{p:<22} code={code_of(body)} {short(body, 90)}"
-                  + (f"  Allow: {allow}" if allow else ""))
+            print(
+                f"  {st:>3}  POST /xled/v2/{p:<22} code={code_of(body)} {short(body, 90)}"
+                + (f"  Allow: {allow}" if allow else "")
+            )
     print(f"  ({len(POST_EMPTY)} paths tried, {hits} not 404)")
 
 
@@ -303,7 +338,9 @@ def part_g(h: Http, a: dict) -> None:
         print(f"  {p}: {'same' if j == a.get(p) else 'CHANGED: ' + json.dumps(mask(j))}")
     st, j = h.get_json("gestalt")
     for k in ("group", "device_config", "artnet_en", "network", "device_name"):
-        print(f"  gestalt.{k}: {'same' if j.get(k) == a.get('gestalt', {}).get(k) else 'CHANGED: ' + json.dumps(j.get(k))}")
+        print(
+            f"  gestalt.{k}: {'same' if j.get(k) == a.get('gestalt', {}).get(k) else 'CHANGED: ' + json.dumps(j.get(k))}"
+        )
     print(f"  final app_mode={app_mode(h)}")
 
 

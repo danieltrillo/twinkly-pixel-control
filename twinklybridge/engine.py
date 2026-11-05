@@ -190,6 +190,11 @@ class DeviceRunner:
             self.warnings.append(f"config says {self.cfg.pixels} pixels, device reports {info.number_of_led}")
         if len(self.order) != info.bytes_per_led:
             self.warnings.append(f"order {self.order} has {len(self.order)} bytes, device is {info.led_profile}")
+        if info.group_mode == "slave":
+            self.warnings.append(
+                f"controller is a group slave (size {info.group_size}, offset {info.group_offset}); "
+                "Pro firmware refuses realtime until it leaves the group"
+            )
         for w in self.warnings:
             log.warning("%s (%s): %s", self.name, self.cfg.ip, w)
         self._login_at = self.clock()

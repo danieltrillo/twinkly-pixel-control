@@ -26,7 +26,7 @@ import urllib.error
 import urllib.request
 
 UDP_PORT = 7777
-FRAGMENT_BYTES = 900          # max pixel bytes per UDP datagram (protocol v3)
+FRAGMENT_BYTES = 900  # max pixel bytes per UDP datagram (protocol v3)
 
 
 # ----------------------------------------------------------------- HTTP API --
@@ -36,25 +36,22 @@ class Twinkly:
         self.base = f"http://{ip}:{http_port}/xled/v1"
         self.udp_addr = (ip, udp_port)
         self.timeout = timeout
-        self.token = None          # base64 string, used in HTTP header
-        self.token_raw = None      # 8 raw bytes, used in UDP packets
+        self.token = None  # base64 string, used in HTTP header
+        self.token_raw = None  # 8 raw bytes, used in UDP packets
 
     def _req(self, method, path, body=None, auth=True):
         headers = {"Content-Type": "application/json"}
         if auth and self.token:
             headers["X-Auth-Token"] = self.token
         data = json.dumps(body).encode() if body is not None else None
-        req = urllib.request.Request(self.base + path, data=data,
-                                     headers=headers, method=method)
+        req = urllib.request.Request(self.base + path, data=data, headers=headers, method=method)
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as r:
                 raw = r.read()
         except urllib.error.HTTPError as e:
-            raise RuntimeError(f"{method} {path} -> HTTP {e.code}: "
-                               f"{e.read()[:200]!r}") from None
+            raise RuntimeError(f"{method} {path} -> HTTP {e.code}: {e.read()[:200]!r}") from None
         except (TimeoutError, urllib.error.URLError, OSError) as e:
-            raise RuntimeError(f"{method} {path} -> can't reach {self.ip} "
-                               f"({e})") from None
+            raise RuntimeError(f"{method} {path} -> can't reach {self.ip} ({e})") from None
         try:
             return json.loads(raw) if raw else {}
         except ValueError:
@@ -73,8 +70,7 @@ class Twinkly:
             raise RuntimeError(f"login failed: {r}")
         self.token = r["authentication_token"]
         self.token_raw = base64.b64decode(self.token)
-        v = self.post("/verify",
-                      {"challenge-response": r.get("challenge-response", "")})
+        v = self.post("/verify", {"challenge-response": r.get("challenge-response", "")})
         if v.get("code") != 1000:
             raise RuntimeError(f"verify failed: {v}")
 
@@ -108,7 +104,7 @@ def build_packets(proto, token_raw, frame, n_leds):
         pkts = []
         for i, start in enumerate(range(0, len(frame), FRAGMENT_BYTES)):
             hdr = b"\x03" + token_raw + b"\x00\x00" + bytes([i & 0xFF])
-            pkts.append(hdr + frame[start:start + FRAGMENT_BYTES])
+            pkts.append(hdr + frame[start : start + FRAGMENT_BYTES])
         return pkts
     if proto == 2:
         return [b"\x02" + token_raw + b"\x00" + frame]
@@ -156,7 +152,7 @@ class Streamer:
             if delay > 0:
                 time.sleep(delay)
             else:
-                nxt = time.monotonic()   # fell behind; don't spiral
+                nxt = time.monotonic()  # fell behind; don't spiral
 
 
 # ------------------------------------------------------------------ helpers --
@@ -165,8 +161,7 @@ def hsv(h):
     h = (h % 1.0) * 6
     i, f = int(h), h - int(h)
     q, t = int(255 * (1 - f)), int(255 * f)
-    return [(255, t, 0, 0), (q, 255, 0, 0), (0, 255, t, 0),
-            (0, q, 255, 0), (t, 0, 255, 0), (255, 0, q, 0)][i % 6]
+    return [(255, t, 0, 0), (q, 255, 0, 0), (0, 255, t, 0), (0, q, 255, 0), (t, 0, 255, 0), (255, 0, q, 0)][i % 6]
 
 
 def show_info(dev):
@@ -174,10 +169,20 @@ def show_info(dev):
     g = dev.get("/gestalt", auth=False)
     print(f"\n== Twinkly @ {dev.ip} ==")
     print(f"  firmware        : {fw.get('version', '?')}")
-    for k in ("product_code", "device_name", "fw_family", "hardware_version",
-              "led_profile", "bytes_per_led", "number_of_led",
-              "max_supported_led", "frame_rate", "measured_frame_rate",
-              "wire_type", "mac"):
+    for k in (
+        "product_code",
+        "device_name",
+        "fw_family",
+        "hardware_version",
+        "led_profile",
+        "bytes_per_led",
+        "number_of_led",
+        "max_supported_led",
+        "frame_rate",
+        "measured_frame_rate",
+        "wire_type",
+        "mac",
+    ):
         if k in g:
             print(f"  {k:<16}: {g[k]}")
     try:
@@ -189,8 +194,7 @@ def show_info(dev):
         if strings:
             print(f"  outputs/strings : {len(strings)}")
             for i, s in enumerate(strings):
-                print(f"    port {i + 1}: first_led={s.get('first_led_id')} "
-                      f"length={s.get('length')}")
+                print(f"    port {i + 1}: first_led={s.get('first_led_id')} length={s.get('length')}")
     except RuntimeError as e:
         print(f"  (login/extra info failed: {e})")
     print("\n  raw gestalt (paste this back if something looks off):")
@@ -214,8 +218,7 @@ def run_test(dev, fps, order, proto_override, auto_yes):
         sys.exit("Controller reports 0 LEDs - check it in the Twinkly app.")
     proto = proto_override or pick_protocol(fw)
     s = Streamer(dev, n, profile, proto, order)
-    print(f"\n  streaming {n} px, profile {profile}, byte order {s.order}, "
-          f"UDP protocol v{proto}, target {fps} fps")
+    print(f"\n  streaming {n} px, profile {profile}, byte order {s.order}, UDP protocol v{proto}, target {fps} fps")
 
     prev_mode = dev.get("/led/mode").get("mode", "movie")
     dev.set_mode("rt")
@@ -230,34 +233,43 @@ def run_test(dev, fps, order, proto_override, auto_yes):
         s.hold(fn, secs, fps)
         s.send(black)
         if not auto_yes:
-            results[name] = ask("   what did you see? (y = as expected, "
-                                "or describe it): ") or "(no answer)"
+            results[name] = ask("   what did you see? (y = as expected, or describe it): ") or "(no answer)"
         else:
             results[name] = "(auto)"
 
     try:
         # 1. color order: whole strand one channel at a time
-        for label, px in (("RED", (255, 0, 0, 0)), ("GREEN", (0, 255, 0, 0)),
-                          ("BLUE", (0, 0, 255, 0)), ("WHITE chip", (0, 0, 0, 255))):
-            step(f"color {label}", f"whole strand should be {label}",
-                 lambda t, px=px: [px] * n, 3)
+        for label, px in (
+            ("RED", (255, 0, 0, 0)),
+            ("GREEN", (0, 255, 0, 0)),
+            ("BLUE", (0, 0, 255, 0)),
+            ("WHITE chip", (0, 0, 0, 255)),
+        ):
+            step(f"color {label}", f"whole strand should be {label}", lambda t, px=px: [px] * n, 3)
 
         # 2. per-pixel addressing: first pixel, last pixel, walking dot
-        step("first pixel", "ONLY the pixel nearest the controller lit (green)",
-             lambda t: [(0, 255, 0, 0)] + [(0, 0, 0, 0)] * (n - 1), 3)
-        step("last pixel", "ONLY the far-end pixel lit (blue)",
-             lambda t: [(0, 0, 0, 0)] * (n - 1) + [(0, 0, 255, 0)], 3)
+        step(
+            "first pixel",
+            "ONLY the pixel nearest the controller lit (green)",
+            lambda t: [(0, 255, 0, 0)] + [(0, 0, 0, 0)] * (n - 1),
+            3,
+        )
+        step(
+            "last pixel", "ONLY the far-end pixel lit (blue)", lambda t: [(0, 0, 0, 0)] * (n - 1) + [(0, 0, 255, 0)], 3
+        )
         chase_secs = min(max(n / fps, 4), 20)
-        step("chase", "a single red dot walks from controller end to far end",
-             lambda t: [(255, 0, 0, 0) if i == int(t / chase_secs * n) else
-                        (0, 0, 0, 0) for i in range(n)], chase_secs)
+        step(
+            "chase",
+            "a single red dot walks from controller end to far end",
+            lambda t: [(255, 0, 0, 0) if i == int(t / chase_secs * n) else (0, 0, 0, 0) for i in range(n)],
+            chase_secs,
+        )
 
         # 3. smoothness / frame rate: scrolling rainbow
         print("\n-- rainbow: scrolling rainbow for 10 s (watch for stutter)")
         dev.set_mode("rt")
         t0, f0 = time.monotonic(), s.frames_sent
-        s.hold(lambda t: [hsv(i / max(n, 1) + t * 0.5) for i in range(n)],
-               10, fps)
+        s.hold(lambda t: [hsv(i / max(n, 1) + t * 0.5) for i in range(n)], 10, fps)
         sent_fps = (s.frames_sent - f0) / (time.monotonic() - t0)
         s.send(black)
         try:
@@ -265,11 +277,9 @@ def run_test(dev, fps, order, proto_override, auto_yes):
             measured = g2.get("measured_frame_rate", "n/a")
         except RuntimeError:
             measured = "n/a"
-        results["rainbow"] = (f"sent {sent_fps:.1f} fps; controller reports "
-                              f"measured_frame_rate={measured}")
+        results["rainbow"] = f"sent {sent_fps:.1f} fps; controller reports measured_frame_rate={measured}"
         if not auto_yes:
-            results["rainbow"] += " | you saw: " + (
-                ask("   smooth, or stuttery/flickery? ") or "(no answer)")
+            results["rainbow"] += " | you saw: " + (ask("   smooth, or stuttery/flickery? ") or "(no answer)")
     except KeyboardInterrupt:
         print("\n  stopped early")
     finally:
@@ -280,25 +290,32 @@ def run_test(dev, fps, order, proto_override, auto_yes):
             print(f"\n  couldn't restore mode ({e}) - pick a movie in the app")
 
     print("\n== RESULTS (copy/paste this whole block back to Claude) ==")
-    print(f"ip={dev.ip} fw={fw} product={g.get('product_code')} "
-          f"profile={profile} leds={n} proto=v{proto} order={s.order} fps={fps}")
+    print(
+        f"ip={dev.ip} fw={fw} product={g.get('product_code')} "
+        f"profile={profile} leds={n} proto=v{proto} order={s.order} fps={fps}"
+    )
     for k, v in results.items():
         print(f"  {k:<14}: {v}")
 
 
 # --------------------------------------------------------------------- main --
 def main():
-    ap = argparse.ArgumentParser(description=__doc__,
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("command", choices=["info", "test"])
     ap.add_argument("ip")
-    ap.add_argument("--fps", type=float, default=40,
-                    help="frames per second to send (default 40)")
-    ap.add_argument("--order", default=None,
-                    help="byte order override, e.g. RGBW or GRBW "
-                         "(default: WRGB for RGBW strands, per Twinkly docs)")
-    ap.add_argument("--proto", type=int, choices=[1, 2, 3], default=None,
-                    help="force UDP protocol version (default: auto from firmware)")
+    ap.add_argument("--fps", type=float, default=40, help="frames per second to send (default 40)")
+    ap.add_argument(
+        "--order",
+        default=None,
+        help="byte order override, e.g. RGBW or GRBW (default: WRGB for RGBW strands, per Twinkly docs)",
+    )
+    ap.add_argument(
+        "--proto",
+        type=int,
+        choices=[1, 2, 3],
+        default=None,
+        help="force UDP protocol version (default: auto from firmware)",
+    )
     ap.add_argument("--http-port", type=int, default=80, help=argparse.SUPPRESS)
     ap.add_argument("--udp-port", type=int, default=UDP_PORT, help=argparse.SUPPRESS)
     ap.add_argument("--yes", action="store_true", help=argparse.SUPPRESS)

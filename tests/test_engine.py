@@ -301,3 +301,47 @@ def test_status_is_json_friendly():
     eng = Engine(cfg, sender=lambda p, a: True)
     json.dumps(eng.status())
     assert isinstance(eng.devices[0], DeviceRunner)
+
+
+def test_streams_to_pro_v2_firmware(fast):
+    async def scenario():
+        fake = FakeTwinkly(pixels=200, api="v2", firmware="4.0.1", product="TWPROCTRLPLC21")
+        await fake.start()
+        eng = await start_bridge(fake)
+        try:
+            dev = eng.devices[0]
+            assert await wait_for(lambda: dev.ready)
+            assert dev.info.api == "v2" and dev.info.firmware == "4.0.1" and dev.protocol == 3
+            assert dev.info.led_profile == "RGBW" and dev.info.group_mode == "none"
+            assert not dev.warnings
+            eng.feed("artnet", 0, rgbw_universe(128, (10, 20, 30, 40)), "2.0.0.1")
+            eng.feed("artnet", 1, rgbw_universe(72, (1, 2, 3, 4)), "2.0.0.1")
+            assert await wait_for(lambda: fake.mode == "rt" and fake.frames > 0 and fake.pixel(199) == (4, 1, 2, 3))
+            assert fake.pixel(0) == (40, 10, 20, 30) and fake.bad_packets == 0
+            assert fake.modes == ["rt"]  # via /xled/v2/application/mode
+        finally:
+            await eng.stop()
+            await fake.stop()
+        assert fake.mode == "movie" and fake.modes == ["rt", "movie"]
+
+    run(scenario())
+
+
+def test_group_slave_is_reported(fast):
+    async def scenario():
+        fake = FakeTwinkly(pixels=4, api="v2", firmware="4.0.1", group_slave=True)
+        await fake.start()
+        eng = await start_bridge(fake)
+        try:
+            dev = eng.devices[0]
+            assert await wait_for(lambda: dev.ready)
+            assert any("group slave" in w for w in dev.warnings)
+            eng.feed("artnet", 0, rgbw_universe(4, (1, 1, 1, 1)), "2.0.0.1")
+            assert await wait_for(lambda: dev.state == "offline", 3.0)
+            assert "403" in dev.error and "group" in dev.error
+            assert fake.mode == "movie" and fake.frames == 0
+        finally:
+            await eng.stop()
+            await fake.stop()
+
+    run(scenario())

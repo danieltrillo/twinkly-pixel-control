@@ -56,9 +56,32 @@ echo logout users roles auth auth/role
 ui ui/config web
 """.split()
 
-UI_PATHS = ["/", "/index.html", "/ui", "/ui/", "/ui/index.html", "/app", "/app/", "/web/", "/admin", "/login",
-            "/static/", "/assets/", "/favicon.ico", "/manifest.json", "/main.js", "/app.js", "/bundle.js",
-            "/index.js", "/xled/", "/xled/v2/", "/xled/v3/gestalt", "/api", "/api/v1", "/api/v2"]
+UI_PATHS = [
+    "/",
+    "/index.html",
+    "/ui",
+    "/ui/",
+    "/ui/index.html",
+    "/app",
+    "/app/",
+    "/web/",
+    "/admin",
+    "/login",
+    "/static/",
+    "/assets/",
+    "/favicon.ico",
+    "/manifest.json",
+    "/main.js",
+    "/app.js",
+    "/bundle.js",
+    "/index.js",
+    "/xled/",
+    "/xled/v2/",
+    "/xled/v3/gestalt",
+    "/api",
+    "/api/v1",
+    "/api/v2",
+]
 
 
 class Http:
@@ -68,8 +91,14 @@ class Http:
         self.token = ""
         self.token_raw = b""
 
-    def call(self, method: str, url: str, body: bytes | dict | None = None, auth: bool = True,
-             ctype: str = "application/json") -> tuple[int, dict, bytes]:
+    def call(
+        self,
+        method: str,
+        url: str,
+        body: bytes | dict | None = None,
+        auth: bool = True,
+        ctype: str = "application/json",
+    ) -> tuple[int, dict, bytes]:
         """-> (status, headers, body). status 0 = no HTTP answer."""
         headers = {}
         data = None
@@ -139,8 +168,10 @@ def login(h: Http, api: str) -> dict:
         sys.exit("login failed")
     h.token = token
     h.token_raw = base64.b64decode(token)
-    print(f"  token: {len(h.token_raw)} raw bytes, expires_in={j.get('authentication_token_expires_in')}, "
-          f"role={j.get('auth-role', '?')}")
+    print(
+        f"  token: {len(h.token_raw)} raw bytes, expires_in={j.get('authentication_token_expires_in')}, "
+        f"role={j.get('auth-role', '?')}"
+    )
     st, _, body = h.api("POST", api, "verify", {"challenge-response": j.get("challenge-response", "")})
     print(f"  POST verify -> {st} {short(body, 120)}")
     return j
@@ -195,7 +226,7 @@ def udp_probe(h: Http, ip: str, port: int, n_leds: int, bpl: int) -> None:
     frame = bytes([0, 0, 8, 0] if bpl == 4 else [0, 8, 0]) * n_leds  # dim green-ish whatever the order
     packets = []
     for i, start in enumerate(range(0, len(frame), FRAGMENT)):
-        packets.append(b"\x03" + h.token_raw + b"\x00\x00" + bytes([i]) + frame[start:start + FRAGMENT])
+        packets.append(b"\x03" + h.token_raw + b"\x00\x00" + bytes([i]) + frame[start : start + FRAGMENT])
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.settimeout(1.0)
     sock.connect((ip, port))
@@ -227,8 +258,11 @@ def http_rt_probe(h: Http, api: str, n_leds: int, bpl: int) -> None:
         (f"{bpl} B/LED x {n_leds} = {len(full)} B", True, full),
         (f"{7 - bpl} B/LED x {n_leds} = {n_leds * (7 - bpl)} B", True, bytes(n_leds * (7 - bpl))),
         ("100 B (too short)", True, bytes(100)),
-        ("header 0x03+token+00 00 00 then frame (UDP-style body)", True,
-         b"\x03" + h.token_raw + b"\x00\x00\x00" + full),
+        (
+            "header 0x03+token+00 00 00 then frame (UDP-style body)",
+            True,
+            b"\x03" + h.token_raw + b"\x00\x00\x00" + full,
+        ),
     ]
     for label, auth, body in cases:
         t0 = time.perf_counter()
@@ -259,8 +293,10 @@ def mode_probe(h: Http, api: str) -> None:
     ]:
         st, hdr, out = h.api("POST", api, path, body)
         allow = hdr.get("Allow") or hdr.get("allow") or ""
-        print(f"  POST {path} {json.dumps(body)} -> {st} code={code_of(out)} {short(out, 100)}"
-              + (f" Allow: {allow}" if allow else ""))
+        print(
+            f"  POST {path} {json.dumps(body)} -> {st} code={code_of(out)} {short(out, 100)}"
+            + (f" Allow: {allow}" if allow else "")
+        )
 
 
 def snapshot(h: Http, api: str, found: dict[str, int]) -> dict[str, str]:
@@ -286,9 +322,11 @@ def main() -> None:
     profile = (g.get("led_profile") or cfg.get("led_profile") or "RGB").upper()
     bpl = 4 if profile == "RGBW" else 3
     n_leds = int(g.get("number_of_led") or 0)
-    print(f"  API /xled/{api}: {g.get('product_code')} '{g.get('device_name')}' {n_leds} {profile} LEDs, "
-          f"group={g.get('group')}, artnet_en={g.get('artnet_en')}, frame_rate={g.get('frame_rate')}, "
-          f"uptime={g.get('uptime')}")
+    print(
+        f"  API /xled/{api}: {g.get('product_code')} '{g.get('device_name')}' {n_leds} {profile} LEDs, "
+        f"group={g.get('group')}, artnet_en={g.get('artnet_en')}, frame_rate={g.get('frame_rate')}, "
+        f"uptime={g.get('uptime')}"
+    )
 
     section("login")
     login(h, api)

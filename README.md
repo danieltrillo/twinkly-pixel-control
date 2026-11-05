@@ -24,10 +24,18 @@ uses for mapping.
 It runs on Linux, macOS or a Pi with Python 3.11+. It needs two libraries
 (`PyYAML`, `aiohttp`) and no special privileges.
 
-> **Status:** v0.1. It's tested against a simulated controller. Testing on
-> real Twinkly Pro hardware is next. The realtime protocol is unofficial and
-> community documented ([xled-docs](https://xled-docs.readthedocs.io/en/latest/protocol_details.html)),
+> **Status:** v0.1. It's tested against a simulated controller. The realtime
+> protocol is unofficial and community documented
+> ([xled-docs](https://xled-docs.readthedocs.io/en/latest/protocol_details.html)),
 > so step 1 below matters.
+>
+> **Twinkly Pro firmware 4.x** (TWPROCTRLPLC21, fw 4.0.1) was probed with the
+> bridge: it only speaks `/xled/v2`, which the bridge detects and uses
+> (`application/mode`, `fw/ct1/version`, nested result codes). One catch found
+> so far: while a Pro controller is a **slave in a group**, the firmware refuses
+> every output write with HTTP 403, realtime included. Take the controller out
+> of its group in the Twinkly Pro app before streaming to it. Realtime frames on
+> an ungrouped Pro controller are still to be confirmed on hardware.
 
 ## Step 1: prove one controller
 
@@ -175,7 +183,9 @@ twinkly-bridge send --to 127.0.0.1 --universe 0.0.0-0.0.2 --pattern rainbow
 
 For a device, set `ip: 127.0.0.1`, `http_port: 8081` and `rt_port: 7778` to
 point the bridge at the fake. It prints the fps it receives and the first
-pixel's bytes.
+pixel's bytes. `--api v2` makes it behave like Pro firmware 4.x, and
+`--group-slave` makes it refuse output writes the way a grouped Pro
+controller does.
 
 ## Commands
 
@@ -199,6 +209,7 @@ pixel's bytes.
 | Flicker or two looks fighting | Twinkly's own Art-Net mode is on, or the Twinkly app is open and mapping. |
 | Low fps out | Look at "send errors" on the status page. Twinkly renders about 24 fps, so above that frames are dropped by the controller. |
 | Pixel count warning | The controller reports a different LED count than `pixels:`. The bridge sends what the controller reports. |
+| **set mode 'rt' refused (403)** or a "group slave" warning | Pro firmware: the controller is a slave in a group and refuses all output writes. Take it out of its group in the Twinkly Pro app. |
 
 ## Not in this version
 

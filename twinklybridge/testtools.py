@@ -39,7 +39,11 @@ class FakeTwinkly:
         http_port: int = 0,
         rt_port: int = 0,
         rt_timeout: float = 3.0,
+        api: str = "v1",
+        group_slave: bool = False,
     ) -> None:
+        self.api = api  # "v1" (consumer) or "v2" (Pro firmware 4.x: /xled/v2, result codes nested)
+        self.group_slave = group_slave
         self.pixels = pixels
         self.profile = profile.upper()
         self.bpl = 4 if self.profile == "RGBW" else 3
@@ -69,9 +73,21 @@ class FakeTwinkly:
     def _authed(self, request: web.Request) -> bool:
         return bool(self.token_b64) and request.headers.get("X-Auth-Token") == self.token_b64
 
-    @staticmethod
-    def _denied() -> web.Response:
-        return web.Response(status=401, text="Invalid Token.")
+    def _ok(self, payload: dict, code: int = CODE_OK) -> web.Response:
+        """v1 puts the code at the top level; v2 nests it under result."""
+        if self.api == "v1":
+            return web.json_response({**payload, "code": code})
+        return web.json_response({**payload, "result": {"code": code}})
+
+    def _denied(self) -> web.Response:
+        if self.api == "v1":
+            return web.Response(status=401, text="Invalid Token.")
+        return web.json_response({"result": {"code": 2401}}, status=401)
+
+    async def _not_found(self, request: web.Request) -> web.Response:
+        if self.api == "v1":
+            return web.Response(status=404, text="Resource not found.")
+        return web.json_response({"result": {"code": 2404}}, status=404)
 
     async def _login(self, request: web.Request) -> web.Response:
         body = await request.json()
@@ -80,60 +96,92 @@ class FakeTwinkly:
         self.token = os.urandom(8)
         self.token_b64 = base64.b64encode(self.token).decode()
         self.logins += 1
-        return web.json_response(
+        extra = {"auth-role": "user"} if self.api == "v2" else {}
+        return self._ok(
             {
                 "authentication_token": self.token_b64,
                 "authentication_token_expires_in": 14400,
                 "challenge-response": "ab" * 20,
-                "code": CODE_OK,
+                **extra,
             }
         )
 
     async def _verify(self, request: web.Request) -> web.Response:
         if not self._authed(request):
             return self._denied()
-        return web.json_response({"code": CODE_OK})
+        return self._ok({})
 
     async def _fw(self, request: web.Request) -> web.Response:
-        return web.json_response({"version": self.firmware, "code": CODE_OK})
+        if self.api == "v1":
+            return self._ok({"version": self.firmware})
+        return web.json_response({"version": self.firmware, "desc": "Release build (fake)"})
 
     async def _gestalt(self, request: web.Request) -> web.Response:
-        return web.json_response(
+        if self.api == "v1":
+            return self._ok(
+                {
+                    "product_name": "Twinkly",
+                    "product_code": self.product,
+                    "device_name": f"Twinkly_FAKE{self.http_port}",
+                    "fw_family": "G",
+                    "led_profile": self.profile,
+                    "bytes_per_led": self.bpl,
+                    "number_of_led": self.pixels,
+                    "max_supported_led": 1500,
+                    "frame_rate": 24,
+                    "measured_frame_rate": 24.0,
+                    "mac": "02:00:00:00:00:01",
+                }
+            )
+        # shaped like a real TWPROCTRLPLC21 on firmware 4.0.1
+        group = (
+            {"mode": "slave", "uid": "FAKE-GROUP", "size": 36000, "offset": 34560}
+            if self.group_slave
+            else {"mode": "none", "uid": "", "size": 0, "offset": 0}
+        )
+        return self._ok(
             {
-                "product_name": "Twinkly",
                 "product_code": self.product,
-                "device_name": f"Twinkly_FAKE{self.http_port}",
-                "fw_family": "G",
-                "led_profile": self.profile,
-                "bytes_per_led": self.bpl,
-                "number_of_led": self.pixels,
+                "device_name": f"TwPRO_FAKE{self.http_port}",
+                "uptime": 1,
                 "max_supported_led": 1500,
-                "frame_rate": 24,
-                "measured_frame_rate": 24.0,
-                "mac": "02:00:00:00:00:01",
-                "code": CODE_OK,
+                "number_of_led": self.pixels,
+                "device_config": {
+                    "led_drv": "d9865c",
+                    "led_id": 182,
+                    "led_profile": self.profile,
+                    "ports": [{"port_id": 0, "strings": [{"start": 1, "len": self.pixels}]}],
+                },
+                "group": group,
+                "frame_rate": 10,
+                "artnet_en": False,
+                "network": {"dhcp": True, "ip": self.host, "netmask": "255.255.255.0", "gateway": self.host},
+                "cloud": True,
+                "rest_locked": False,
             }
         )
 
     async def _get_mode(self, request: web.Request) -> web.Response:
         if not self._authed(request):
             return self._denied()
-        return web.json_response({"mode": self.mode, "code": CODE_OK})
+        return self._ok({"mode": self.mode})
 
     async def _set_mode(self, request: web.Request) -> web.Response:
         if not self._authed(request):
             return self._denied()
+        if self.group_slave:
+            return web.json_response({"result": {"code": 2403}}, status=403)
         body = await request.json()
         self.mode = str(body.get("mode"))
         self.modes.append(self.mode)
         if self.mode == "rt":
             self.last_udp = time.monotonic()
-        return web.json_response({"code": CODE_OK})
+        return self._ok({})
 
     async def _led_config(self, request: web.Request) -> web.Response:
         if not self._authed(request):
             return self._denied()
-        return web.json_response({"strings": [{"first_led_id": 0, "length": self.pixels}], "code": CODE_OK})
+        return self._ok({"strings": [{"first_led_id": 0, "length": self.pixels}]})
 
     # -- UDP ------------------------------------------------------------------
 
@@ -177,13 +225,20 @@ class FakeTwinkly:
 
     async def start(self) -> None:
         app = web.Application()
-        app.router.add_post("/xled/v1/login", self._login)
-        app.router.add_post("/xled/v1/verify", self._verify)
-        app.router.add_get("/xled/v1/fw/version", self._fw)
-        app.router.add_get("/xled/v1/gestalt", self._gestalt)
-        app.router.add_get("/xled/v1/led/mode", self._get_mode)
-        app.router.add_post("/xled/v1/led/mode", self._set_mode)
-        app.router.add_get("/xled/v1/led/config", self._led_config)
+        v = self.api
+        app.router.add_post(f"/xled/{v}/login", self._login)
+        app.router.add_post(f"/xled/{v}/verify", self._verify)
+        app.router.add_get(f"/xled/{v}/gestalt", self._gestalt)
+        if v == "v1":
+            app.router.add_get("/xled/v1/fw/version", self._fw)
+            app.router.add_get("/xled/v1/led/mode", self._get_mode)
+            app.router.add_post("/xled/v1/led/mode", self._set_mode)
+            app.router.add_get("/xled/v1/led/config", self._led_config)
+        else:
+            app.router.add_get("/xled/v2/fw/ct1/version", self._fw)
+            app.router.add_get("/xled/v2/application/mode", self._get_mode)
+            app.router.add_post("/xled/v2/application/mode", self._set_mode)
+        app.router.add_route("*", "/{tail:.*}", self._not_found)
         self._runner = web.AppRunner(app, access_log=None)
         await self._runner.setup()
         site = web.TCPSite(self._runner, self.host, self.http_port)
@@ -211,6 +266,8 @@ async def run_fake(args) -> None:
         host=args.host,
         http_port=args.http_port,
         rt_port=args.rt_port,
+        api=args.api,
+        group_slave=args.group_slave,
     )
     await fake.start()
     print(
@@ -237,6 +294,8 @@ def add_fake_command(sub) -> None:
     p.add_argument("--host", default="127.0.0.1", help="address to listen on (default 127.0.0.1)")
     p.add_argument("--http-port", type=int, default=8081)
     p.add_argument("--rt-port", type=int, default=7778)
+    p.add_argument("--api", choices=["v1", "v2"], default="v1", help="v2 = behave like Pro firmware 4.x")
+    p.add_argument("--group-slave", action="store_true", help="v2 only: refuse output writes like a group slave")
 
     def _run(args) -> int:
         try:
