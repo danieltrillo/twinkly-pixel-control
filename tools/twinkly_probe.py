@@ -13,6 +13,7 @@ Usage:
   python3 twinkly_probe.py info  <controller-ip>
   python3 twinkly_probe.py test  <controller-ip> [--fps 40] [--order WRGB] [--yes --hold 6]
   python3 twinkly_probe.py locate <controller-ip> [--seconds 60] [--hz 4] [--width 1] [--which both]
+  python3 twinkly_probe.py chunks <controller-ip> [--hold 8]     # which output is which
 
 Reference: https://xled-docs.readthedocs.io/en/latest/protocol_details.html
 """
@@ -409,6 +410,104 @@ def run_test(dev, fps, order, proto_override, auto_yes, hold=3.0):
         print(f"  {k:<14}: {v}")
 
 
+# ------------------------------------------------------------------- chunks --
+OUTPUT_COLORS = [
+    ("RED", (255, 0, 0, 0)),
+    ("GREEN", (0, 255, 0, 0)),
+    ("BLUE", (0, 0, 255, 0)),
+    ("YELLOW", (255, 255, 0, 0)),
+    ("CYAN", (0, 255, 255, 0)),
+    ("MAGENTA", (255, 0, 255, 0)),
+    ("WHITE chip", (0, 0, 0, 255)),
+    ("ORANGE", (255, 80, 0, 0)),
+]
+
+
+def output_ranges(dev, g, n):
+    """Pixel ranges per physical output, as (first, end) 0-based half-open, in output order."""
+    ranges = []
+    for port in device_config(g).get("ports", []):  # Pro v2: start is 1-based
+        for st in port.get("strings", []):
+            start, length = int(st.get("start", 1)), int(st.get("len", 0))
+            if length > 0:
+                ranges.append((max(start - 1, 0), max(start - 1, 0) + length))
+    if not ranges and dev.api == "v1":
+        try:
+            for st in dev.get("/led/config").get("strings", []):
+                first, length = int(st.get("first_led_id", 0)), int(st.get("length", 0))
+                if length > 0:
+                    ranges.append((first, first + length))
+        except RuntimeError:
+            pass
+    ranges = [(a, min(b, n)) for a, b in ranges if a < n]
+    return ranges or [(0, n)]
+
+
+def run_chunks(dev, fps, order, proto_override, hold):
+    """Light every output in its own colour, then walk a white dot through each output in turn."""
+    fw, g = show_info(dev)
+    n = int(g.get("number_of_led", 0))
+    profile = profile_of(g)
+    if n <= 0:
+        sys.exit("Controller reports 0 LEDs - check it in the Twinkly app.")
+    if group_of(g)[0] == "slave":
+        sys.exit("Controller is a group slave; Pro firmware refuses realtime. Take it out of its group first.")
+    proto = proto_override or pick_protocol(fw)
+    s = Streamer(dev, n, profile, proto, order)
+    ranges = output_ranges(dev, g, n)
+    black = [(0, 0, 0, 0)] * n
+    print(f"\n  {len(ranges)} output(s):")
+    for k, (a, b) in enumerate(ranges):
+        print(f"    output {k + 1}: pixels {a + 1}-{b} ({b - a} px) = {OUTPUT_COLORS[k % len(OUTPUT_COLORS)][0]}")
+
+    def all_outputs(t):
+        px = list(black)
+        for k, (a, b) in enumerate(ranges):
+            px[a:b] = [OUTPUT_COLORS[k % len(OUTPUT_COLORS)][1]] * (b - a)
+        return px
+
+    def one_output(k, secs):
+        a, b = ranges[k]
+        name, color = OUTPUT_COLORS[k % len(OUTPUT_COLORS)]
+        dim = tuple(c // 6 for c in color)
+
+        def fn(t):
+            px = list(black)
+            px[a:b] = [dim] * (b - a)
+            i = a + min(int(t / secs * (b - a)), b - a - 1)
+            px[i] = (255, 255, 255, 255) if profile == "RGBW" else (255, 255, 255, 0)
+            return px
+
+        return fn
+
+    prev_mode = dev.get_mode() or "movie"
+    try:
+        dev.set_mode("rt")
+        print(f"\n-- {time.strftime('%H:%M:%S')} all outputs at once, each its own colour ({hold:g} s)", flush=True)
+        s.hold(all_outputs, hold, fps)
+        s.send(black)
+        time.sleep(1.0)
+        for k, (a, b) in enumerate(ranges):
+            name = OUTPUT_COLORS[k % len(OUTPUT_COLORS)][0]
+            print(
+                f"-- {time.strftime('%H:%M:%S')} output {k + 1} only, dim {name}; a white dot walks pixel {a + 1} -> {b} "
+                f"({hold:g} s)",
+                flush=True,
+            )
+            dev.set_mode("rt")
+            s.hold(one_output(k, hold), hold, fps)
+            s.send(black)
+            time.sleep(1.0)
+    except KeyboardInterrupt:
+        print("\n  stopped early")
+    finally:
+        try:
+            dev.set_mode(prev_mode)
+            print(f"\n  restored mode: {prev_mode}")
+        except RuntimeError as e:
+            print(f"\n  couldn't restore mode ({e}) - pick a movie in the app")
+
+
 # ------------------------------------------------------------------- locate --
 def run_locate(dev, fps, order, proto_override, seconds, hz, width, which):
     """Strobe the first pixel(s) red and the last pixel(s) blue so you can find the ends of the run."""
@@ -460,7 +559,7 @@ def run_locate(dev, fps, order, proto_override, seconds, hz, width, which):
 # --------------------------------------------------------------------- main --
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("command", choices=["info", "test", "locate"])
+    ap.add_argument("command", choices=["info", "test", "locate", "chunks"])
     ap.add_argument("ip")
     ap.add_argument("--fps", type=float, default=40, help="frames per second to send (default 40)")
     ap.add_argument(
@@ -491,6 +590,8 @@ def main():
             show_info(dev)
         elif a.command == "locate":
             run_locate(dev, a.fps, a.order, a.proto, a.seconds, a.hz, a.width, a.which)
+        elif a.command == "chunks":
+            run_chunks(dev, a.fps, a.order, a.proto, a.hold)
         else:
             run_test(dev, a.fps, a.order, a.proto, a.yes, a.hold)
     except RuntimeError as e:

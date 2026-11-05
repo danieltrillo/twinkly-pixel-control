@@ -41,7 +41,9 @@ class FakeTwinkly:
         rt_timeout: float = 3.0,
         api: str = "v1",
         group_slave: bool = False,
+        ports: int = 1,
     ) -> None:
+        self.ports = max(1, ports)  # v2 gestalt lists the pixels split evenly over this many outputs
         self.api = api  # "v1" (consumer) or "v2" (Pro firmware 4.x: /xled/v2, result codes nested)
         self.group_slave = group_slave
         self.pixels = pixels
@@ -155,7 +157,15 @@ class FakeTwinkly:
                     "led_drv": "d9865c",
                     "led_id": 182,
                     "led_profile": self.profile,
-                    "ports": [{"port_id": 0, "strings": [{"start": 1, "len": self.pixels}]}],
+                    "ports": [
+                        {
+                            "port_id": i,
+                            "strings": [
+                                {"start": 1 + i * (self.pixels // self.ports), "len": self.pixels // self.ports}
+                            ],
+                        }
+                        for i in range(self.ports)
+                    ],
                 },
                 "group": group,
                 "frame_rate": 10,
@@ -273,6 +283,7 @@ async def run_fake(args) -> None:
         rt_port=args.rt_port,
         api=args.api,
         group_slave=args.group_slave,
+        ports=args.ports,
     )
     await fake.start()
     print(
@@ -301,6 +312,7 @@ def add_fake_command(sub) -> None:
     p.add_argument("--rt-port", type=int, default=7778)
     p.add_argument("--api", choices=["v1", "v2"], default="v1", help="v2 = behave like Pro firmware 4.x")
     p.add_argument("--group-slave", action="store_true", help="v2 only: refuse output writes like a group slave")
+    p.add_argument("--ports", type=int, default=1, help="v2 only: how many outputs the gestalt lists")
 
     def _run(args) -> int:
         try:
