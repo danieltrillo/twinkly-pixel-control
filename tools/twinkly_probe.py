@@ -14,6 +14,8 @@ Usage:
   python3 twinkly_probe.py test  <controller-ip> [--fps 40] [--order WRGB] [--yes --hold 6]
   python3 twinkly_probe.py locate <controller-ip> [--seconds 60] [--hz 4] [--width 1] [--which both]
   python3 twinkly_probe.py chunks <controller-ip> [--hold 8]     # which output is which
+  python3 twinkly_probe.py scan  <controller-ip> [--slot 0.4] [--brightness 96] [--repeat 2]
+                                                  # blink code for camera mapping (tools/pixelmap.py)
 
 Reference: https://xled-docs.readthedocs.io/en/latest/protocol_details.html
 """
@@ -27,6 +29,9 @@ import sys
 import time
 import urllib.error
 import urllib.request
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+from twinklybridge import mapcode  # noqa: E402  (stdlib only, lives in this repo)
 
 UDP_PORT = 7777
 FRAGMENT_BYTES = 900  # max pixel bytes per UDP datagram (protocol v3)
@@ -565,10 +570,61 @@ def run_locate(dev, fps, order, proto_override, seconds, hz, width, which):
             print(f"\n  couldn't restore mode ({e}) - pick a movie in the app")
 
 
+def run_scan(dev, fps, order, proto_override, slot, brightness, color, repeat, countdown):
+    """Play the camera-mapping blink code (twinklybridge/mapcode.py) on every pixel."""
+    fw, g = show_info(dev)
+    n = int(g.get("number_of_led", 0))
+    profile = profile_of(g)
+    if n <= 0:
+        sys.exit("Controller reports 0 LEDs - check it in the Twinkly app.")
+    if group_of(g)[0] == "slave":
+        sys.exit("Controller is a group slave; Pro firmware refuses realtime. Take it out of its group first.")
+    proto = proto_override or pick_protocol(fw)
+    s = Streamer(dev, n, profile, proto, order)
+    v = max(1, min(int(brightness), 255))
+    if color == "white" and profile == "RGBW":
+        lit = (0, 0, 0, v)
+    elif color == "green":
+        lit = (0, v, 0, 0)
+    else:
+        lit = (v, v, v, 0)
+    black_px = (0, 0, 0, 0)
+    slots = mapcode.schedule(n)
+    words = [mapcode.codeword(i, n) for i in range(n)]
+    frames = [[lit if on else black_px for on in mapcode.lit_mask(sl, n, words)] for sl in slots]
+    total = len(slots) * slot
+    print(
+        f"\n-- scan: {n} px, {mapcode.word_bits(n)} bits, {len(slots)} slots x {slot:g} s = {total:.1f} s"
+        f" per pass, {repeat} pass(es), colour {color} at {v}",
+        flush=True,
+    )
+    print(f"   decode with: python3 tools/pixelmap.py decode VIDEO --pixels {n} --slot {slot:g}", flush=True)
+
+    prev_mode = dev.get_mode() or "movie"
+    try:
+        dev.set_mode("rt")
+        for left in range(int(countdown), 0, -1):
+            print(f"   recording? scan starts in {left} s", flush=True)
+            s.hold(lambda t: [black_px] * n, 1.0, fps)
+        for p in range(repeat):
+            print(f"   pass {p + 1}/{repeat} ({time.strftime('%H:%M:%S')})", flush=True)
+            s.hold(lambda t: frames[min(int(t / slot), len(frames) - 1)], total, fps)
+        s.send([black_px] * n)
+        print("   done - stop recording", flush=True)
+    except KeyboardInterrupt:
+        print("\n  stopped early")
+    finally:
+        try:
+            dev.set_mode(prev_mode)
+            print(f"\n  restored mode: {prev_mode}")
+        except RuntimeError as e:
+            print(f"\n  couldn't restore mode ({e}) - pick a movie in the app")
+
+
 # --------------------------------------------------------------------- main --
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("command", choices=["info", "test", "locate", "chunks"])
+    ap.add_argument("command", choices=["info", "test", "locate", "chunks", "scan"])
     ap.add_argument("ip")
     ap.add_argument("--fps", type=float, default=40, help="frames per second to send (default 40)")
     ap.add_argument(
@@ -591,6 +647,15 @@ def main():
     ap.add_argument("--hz", type=float, default=4, help="locate: strobe rate (default 4)")
     ap.add_argument("--width", type=int, default=1, help="locate: how many pixels at each end (default 1)")
     ap.add_argument("--which", choices=["first", "last", "both"], default="both", help="locate: which end(s)")
+    ap.add_argument(
+        "--slot", type=float, default=mapcode.DEFAULT_SLOT, help="scan: seconds per code slot (default 0.4)"
+    )
+    ap.add_argument("--brightness", type=int, default=96, help="scan: 0-255 level for lit pixels (default 96)")
+    ap.add_argument(
+        "--color", choices=["white", "rgb", "green"], default="white", help="scan: W chip, RGB white or green"
+    )
+    ap.add_argument("--repeat", type=int, default=2, help="scan: passes back to back (default 2)")
+    ap.add_argument("--countdown", type=int, default=5, help="scan: black seconds before the first pass (default 5)")
     a = ap.parse_args()
 
     dev = Twinkly(a.ip, a.http_port, a.udp_port)
@@ -599,6 +664,8 @@ def main():
             show_info(dev)
         elif a.command == "locate":
             run_locate(dev, a.fps, a.order, a.proto, a.seconds, a.hz, a.width, a.which)
+        elif a.command == "scan":
+            run_scan(dev, a.fps, a.order, a.proto, a.slot, a.brightness, a.color, a.repeat, a.countdown)
         elif a.command == "chunks":
             run_chunks(dev, a.fps, a.order, a.proto, a.hold)
         else:

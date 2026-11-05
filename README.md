@@ -195,6 +195,63 @@ the bridge.
    4 hours).
 6. On shutdown it puts each controller back in the mode it was in before.
 
+## Map pixel positions with a camera
+
+Film the controller while it plays a blink code, and `tools/pixelmap.py` works
+out where every pixel is. It exports a fixture list for MADRIX 5 and an
+Advanced Output preset for Resolume Arena 7.
+
+**How the code works.** Each pixel blinks its own number: the Gray code of its
+index plus a 4-bit CRC, 15 bits for 1440 pixels. Every bit shows twice, as the
+bit and then its inverse, so the decoder compares each spot with itself and
+doesn't care how bright or what colour a pixel looks. Two full white flashes
+bracket the code and set the timing. One pass takes about 18 s.
+
+1. Set up the phone on a tripod, lock exposure and focus (long press in the
+   camera app), and frame the whole rig. Darker room = better. Start recording.
+2. Play the code (it counts down 5 s, then runs 2 passes):
+
+       python3 tools/twinkly_probe.py scan <controller-ip>
+
+3. Decode the video (needs `pip install numpy opencv-python-headless`):
+
+       python3 tools/pixelmap.py decode scan.mp4 --pixels 1440 --out front
+
+   You get `front/map.json`, `front/map.csv` and `front/preview.png` (every
+   pixel found, coloured by number, every 10th labelled). Pixels that sit on
+   top of each other from this angle, or are hidden, are listed as missing.
+   Pixels mirrored by a Y-splitter show up as a second spot (an x in the preview).
+
+4. **3D (optional).** Film a second pass from 30-60 degrees around the rig,
+   decode it, then:
+
+       python3 tools/pixelmap.py decode side.mp4 --pixels 1440 --out side
+       python3 tools/pixelmap.py solve3d front/map.json side/map.json --out tree3d --scale 1 240 1.8
+
+   `--scale A B METERS` sets real size from two pixels you measured. Without
+   it the units are relative. `--fov` is the phone camera's field of view
+   across the long side (70 for most main lenses).
+
+5. **Export** with the same patch as the bridge (or `--universe 0.0.0`):
+
+       python3 tools/pixelmap.py export front/map.json \
+           --bridge-config ~/twinkly-bridge.yaml --device "Tree 1" \
+           --madrix tree1-madrix.csv --resolume tree1-resolume.xml
+
+   - MADRIX 5: Patch Editor > File > Import Fixture List, separator Comma,
+     header line on. Map the columns (Product, Fixture ID, Name, Position X/Y/Z,
+     DMX Universe, DMX Channel) and pick a 1-pixel RGBW fixture for the product.
+     MADRIX universes are 1-based, so Art-Net 0.0.0 is written as universe 1
+     (`--madrix-universe-offset`). `--grid` sets the matrix width in voxels.
+   - Resolume Arena 7: copy the XML into the Advanced Output presets folder
+     (Advanced Output > preset menu > Reveal) and load it. One Lumiverse, one 1x1
+     pixel slice per pixel, Auto Span on, so 128 RGBW pixels fill each
+     universe like the bridge expects. `--comp W H` must match your composition.
+
+Test the whole chain with no gear: `python3 tools/pixelmap.py synth fake.mp4
+--pixels 300`, decode it, then `python3 tools/pixelmap.py score
+out/map.json fake.mp4.truth.json`.
+
 ## Testing without gear
 
 ```bash
