@@ -248,6 +248,8 @@ class TwinklyClient:
         return data
 
     async def login(self) -> None:
+        if not self.api:
+            await self.detect()
         challenge = base64.b64encode(os.urandom(32)).decode()
         reply = await self._request("POST", "/login", {"challenge": challenge}, auth=False)
         token = reply.get("authentication_token")
@@ -288,10 +290,13 @@ class TwinklyClient:
         return "/fw/ct1/version" if self.api == "v2" else "/fw/version"
 
     async def info(self) -> DeviceInfo:
+        """Gestalt plus firmware version. Call it after login(): Pro firmware 4.x
+        answers fw/ct1/version only with a token, and this returns "" for the
+        version rather than failing when there is none."""
         gestalt = await self.detect()
         try:
-            fw = (await self._request("GET", self._fw_path, auth=False)).get("version", "")
-        except NotFound:
+            fw = (await self._request("GET", self._fw_path)).get("version", "")
+        except (NotFound, AuthError):
             fw = ""
         return DeviceInfo.from_api(gestalt, fw, self.api)
 

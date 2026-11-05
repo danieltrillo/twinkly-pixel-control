@@ -179,8 +179,8 @@ class DeviceRunner:
     async def connect(self) -> None:
         self.state = "connecting"
         client = TwinklyClient(self.session, self.cfg.ip, port=self.cfg.http_port)
+        await client.login()  # first: Pro firmware 4.x answers fw/ct1/version only with a token
         info = await client.info()
-        await client.login()
         self.client = client
         self.info = info
         self.protocol = protocol_for_firmware(info.firmware)
@@ -256,11 +256,14 @@ class DeviceRunner:
                 await asyncio.sleep(CONTROL_TICK)
             except asyncio.CancelledError:
                 raise
-            except AuthError:
-                log.info("%s: token expired, logging in again", self.name)
-                self._ready = False
-                self.rt_armed = False
             except TwinklyError as exc:
+                if isinstance(exc, AuthError) and self._ready:
+                    # the token expired (or the device rebooted) mid-run: log in again right away
+                    log.info("%s: token expired, logging in again", self.name)
+                    self._ready = False
+                    self.rt_armed = False
+                    continue
+                # a 401 while connecting is not an expired token; back off like any other failure
                 if self._ready or failures == 0:
                     log.warning("%s (%s): %s", self.name, self.cfg.ip, exc)
                 self._ready = False

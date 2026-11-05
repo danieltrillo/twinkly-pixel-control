@@ -245,10 +245,17 @@ def hsv(h):
 
 def show_info(dev):
     g = dev.detect()
+    login_error = None
     try:
-        fw = str(dev.get(dev.fw_path, auth=False).get("version", "?"))
+        dev.login()  # before fw: Pro firmware 4.x answers fw/ct1/version only with a token
+    except RuntimeError as e:
+        login_error = e
+    try:
+        fw = str(dev.get(dev.fw_path).get("version", "?"))
     except NotFound:
         fw = "n/a"
+    except RuntimeError as e:
+        fw = f"n/a ({e})"
     flat = {**device_config(g), **g}  # Pro v2 keeps led_profile etc. under device_config
     print(f"\n== Twinkly @ {dev.ip} (API {dev.api}) ==")
     print(f"  firmware        : {fw}")
@@ -276,7 +283,8 @@ def show_info(dev):
     if group_mode == "slave":
         print("  !! group slave  : Pro firmware refuses realtime until the controller leaves its group")
     try:
-        dev.login()
+        if login_error is not None:
+            raise login_error
         print(f"  current mode    : {dev.get_mode() or 'n/a'}")
         if dev.api == "v1":
             strings = dev.get("/led/config").get("strings", [])
@@ -306,7 +314,7 @@ def ask(prompt):
 
 
 # --------------------------------------------------------------------- test --
-def run_test(dev, fps, order, proto_override, auto_yes):
+def run_test(dev, fps, order, proto_override, auto_yes, hold=3.0):
     fw, g = show_info(dev)
     n = int(g.get("number_of_led", 0))
     profile = profile_of(g)
@@ -324,7 +332,7 @@ def run_test(dev, fps, order, proto_override, auto_yes):
     black = [(0, 0, 0, 0)] * n
 
     def step(name, question, fn, secs):
-        print(f"\n-- {name}: {question}")
+        print(f"\n-- {time.strftime('%H:%M:%S')} {name} ({secs:g} s): {question}", flush=True)
         # rt mode drops back to movie after a few idle seconds (e.g. while
         # you're typing an answer), so re-arm it before every step
         dev.set_mode("rt")
@@ -334,6 +342,7 @@ def run_test(dev, fps, order, proto_override, auto_yes):
             results[name] = ask("   what did you see? (y = as expected, or describe it): ") or "(no answer)"
         else:
             results[name] = "(auto)"
+            time.sleep(1.0)  # a second of black so the steps are easy to tell apart
 
     try:
         # 1. color order: whole strand one channel at a time
@@ -343,17 +352,20 @@ def run_test(dev, fps, order, proto_override, auto_yes):
             ("BLUE", (0, 0, 255, 0)),
             ("WHITE chip", (0, 0, 0, 255)),
         ):
-            step(f"color {label}", f"whole strand should be {label}", lambda t, px=px: [px] * n, 3)
+            step(f"color {label}", f"whole strand should be {label}", lambda t, px=px: [px] * n, hold)
 
         # 2. per-pixel addressing: first pixel, last pixel, walking dot
         step(
             "first pixel",
             "ONLY the pixel nearest the controller lit (green)",
             lambda t: [(0, 255, 0, 0)] + [(0, 0, 0, 0)] * (n - 1),
-            3,
+            hold,
         )
         step(
-            "last pixel", "ONLY the far-end pixel lit (blue)", lambda t: [(0, 0, 0, 0)] * (n - 1) + [(0, 0, 255, 0)], 3
+            "last pixel",
+            "ONLY the far-end pixel lit (blue)",
+            lambda t: [(0, 0, 0, 0)] * (n - 1) + [(0, 0, 255, 0)],
+            hold,
         )
         chase_secs = min(max(n / fps, 4), 20)
         step(
@@ -416,7 +428,8 @@ def main():
     )
     ap.add_argument("--http-port", type=int, default=80, help=argparse.SUPPRESS)
     ap.add_argument("--udp-port", type=int, default=UDP_PORT, help=argparse.SUPPRESS)
-    ap.add_argument("--yes", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--yes", action="store_true", help="don't ask after each step; just run the sequence")
+    ap.add_argument("--hold", type=float, default=3, help="seconds to hold each colour/pixel step (default 3)")
     a = ap.parse_args()
 
     dev = Twinkly(a.ip, a.http_port, a.udp_port)
@@ -424,7 +437,7 @@ def main():
         if a.command == "info":
             show_info(dev)
         else:
-            run_test(dev, a.fps, a.order, a.proto, a.yes)
+            run_test(dev, a.fps, a.order, a.proto, a.yes, a.hold)
     except RuntimeError as e:
         sys.exit(f"\nERROR: {e}")
 

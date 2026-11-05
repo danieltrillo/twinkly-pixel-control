@@ -345,3 +345,21 @@ def test_group_slave_is_reported(fast):
             await fake.stop()
 
     run(scenario())
+
+
+def test_rejected_token_backs_off_instead_of_spinning(fast):
+    async def scenario():
+        fake = FakeTwinkly(pixels=4, api="v2", firmware="4.0.1")
+        fake.reject_tokens = True  # every authenticated call is 401, even right after login
+        await fake.start()
+        eng = await start_bridge(fake)
+        try:
+            dev = eng.devices[0]
+            assert await wait_for(lambda: dev.state == "offline" and "token rejected" in dev.error)
+            await asyncio.sleep(0.6)
+            assert fake.logins <= 10  # BACKOFF is 0.1 s here; a tight loop would log in hundreds of times
+        finally:
+            await eng.stop()
+            await fake.stop()
+
+    run(scenario())

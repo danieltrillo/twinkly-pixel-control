@@ -54,6 +54,7 @@ class FakeTwinkly:
         self.rt_port = rt_port
         self.rt_timeout = rt_timeout
         self.mode = "movie"
+        self.reject_tokens = False  # every authenticated call answers 401, like a device that lost our session
         self.modes: list[str] = []
         self.token_b64 = ""
         self.token = b""
@@ -71,6 +72,8 @@ class FakeTwinkly:
     # -- HTTP -----------------------------------------------------------------
 
     def _authed(self, request: web.Request) -> bool:
+        if self.reject_tokens:
+            return False
         return bool(self.token_b64) and request.headers.get("X-Auth-Token") == self.token_b64
 
     def _ok(self, payload: dict, code: int = CODE_OK) -> web.Response:
@@ -114,6 +117,8 @@ class FakeTwinkly:
     async def _fw(self, request: web.Request) -> web.Response:
         if self.api == "v1":
             return self._ok({"version": self.firmware})
+        if not self._authed(request):
+            return self._denied()  # Pro firmware 4.0.1 wants a token for fw/ct1/version
         return web.json_response({"version": self.firmware, "desc": "Release build (fake)"})
 
     async def _gestalt(self, request: web.Request) -> web.Response:
