@@ -66,64 +66,93 @@ def _project(xyz, rvec, tvec, k):
     return pts.reshape(-1, 2)
 
 
-def test_solve3d_recovers_shape(tmp_path):
-    rng = np.random.default_rng(2)
-    n = 400
+def _cone_tree(n=400):
     t = np.linspace(0, 1, n)
-    xyz = np.stack(
-        [(1 - t) * 0.8 * np.cos(t * 40), 2.0 * t - 1.0, (1 - t) * 0.8 * np.sin(t * 40)], axis=1
-    )  # a cone tree, metres, Y up
-    cam = xyz * [1, -1, -1]  # camera frame: Y down, Z away from camera 1 (a rotation, not a mirror)
-    w, h, fov = 1920, 1080, 70.0
+    ang = t * 40
+    xyz = np.stack([(1 - t) * 0.8 * np.cos(ang), 2.0 * t - 1.0, (1 - t) * 0.8 * np.sin(ang)], axis=1)
+    normals = np.stack([np.cos(ang), np.zeros(n), np.sin(ang)], axis=1)  # pointing out of the tree
+    return xyz, normals  # metres, Y up
+
+
+def _orbit_views(tmp_path, xyz, normals, yaws, fov=70.0, occlude=False, seed=2, outliers=0.0):
+    """Decoded-view JSONs of the tree from cameras 4 m out, level, orbiting it."""
+    rng = np.random.default_rng(seed)
+    n = len(xyz)
+    flip = np.array([1, -1, -1])  # world (Y up) -> camera-style frame (Y down); a rotation, not a mirror
+    w, h = 1920, 1080
     f = (w / 2) / math.tan(math.radians(fov) / 2)
     k = np.array([[f, 0, w / 2], [0, f, h / 2], [0, 0, 1]])
-    views = []
-    for yaw in (0.0, 0.7):
-        # camera 4 m out, orbiting the tree, looking at its middle
+    paths = []
+    for i, yaw in enumerate(yaws):
         rvec = np.array([0.0, yaw, 0.0])
         r = cv2.Rodrigues(rvec)[0]
         c = np.array([4 * math.sin(yaw), 0.0, -4 * math.cos(yaw)])
-        tvec = -r @ c
-        views.append(_project(cam, rvec, tvec, k) + rng.normal(0, 0.3, (n, 2)))
-    paths = []
-    for i, v in enumerate(views):
+        uv = _project(xyz * flip, rvec, -r @ c, k) + rng.normal(0, 0.3, (n, 2))
+        bad = rng.random(n) < outliers  # spots that landed somewhere wrong (reflections, mirrors)
+        uv[bad] += rng.normal(0, 80, (int(bad.sum()), 2))
+        to_cam = c * flip - xyz
+        keep = np.ones(n, bool)
+        if occlude:  # the far side of the tree is hidden behind it
+            keep = (normals * to_cam).sum(1) / np.linalg.norm(to_cam, axis=1) > -0.15
         doc = {
             "pixels": n,
             "source": f"v{i}",
             "image": {"width": w, "height": h},
-            "found": [{"pixel": p, "x": float(x), "y": float(y)} for p, (x, y) in enumerate(v)],
+            "found": [{"pixel": p, "x": float(x), "y": float(y)} for p, (x, y) in enumerate(uv) if keep[p]],
+            "bad": [p for p in range(n) if keep[p] and bad[p]],
         }
-        p = tmp_path / f"v{i}.json"
+        p = tmp_path / f"v{i}" / "map.json"
+        p.parent.mkdir()
         p.write_text(json.dumps(doc))
         paths.append(str(p))
-    out = tmp_path / "3d"
-    pixelmap.main(
-        [
-            "solve3d",
-            paths[0],
-            paths[1],
-            "--out",
-            str(out),
-            "--scale",
-            "1",
-            str(n),
-            str(np.linalg.norm(xyz[0] - xyz[-1])),
-        ]
-    )
-    got = json.loads((out / "map.json").read_text())
-    assert got["dims"] == 3 and len(got["found"]) > 0.95 * n
+    return paths
+
+
+def _shape_error(got, xyz):
     ids = [q["pixel"] for q in got["found"]]
     a = np.array([[q["x"], q["y"], q["z"]] for q in got["found"]])
     b = xyz[ids]
-    # same shape up to rotation/translation (scale fixed by --scale)
     a0, b0 = a - a.mean(0), b - b.mean(0)
     u, _, vt = np.linalg.svd(a0.T @ b0)
-    r = u @ vt
-    if np.linalg.det(r) < 0:
-        u[:, -1] *= -1
-        r = u @ vt
+    d = np.diag([1, 1, np.sign(np.linalg.det(u @ vt))])
+    r = u @ d @ vt
     err = np.linalg.norm(a0 @ r - b0, axis=1)
-    assert np.median(err) < 0.03  # 3 cm on a 2 m tree
+    up = np.corrcoef(a[:, 1], b[:, 1])[0, 1]  # our Y must be the real up
+    return float(np.median(err)), float(up), ids
+
+
+def test_solve3d_two_views(tmp_path):
+    xyz, normals = _cone_tree()
+    paths = _orbit_views(tmp_path, xyz, normals, (0.0, 0.7))
+    out = tmp_path / "3d"
+    scale = str(np.linalg.norm(xyz[0] - xyz[-1]))
+    pixelmap.main(["solve3d", *paths, "--out", str(out), "--scale", "1", str(len(xyz)), scale])
+    got = json.loads((out / "map.json").read_text())
+    assert got["dims"] == 3 and len(got["found"]) > 0.95 * len(xyz)
+    err, up, _ = _shape_error(got, xyz)
+    assert err < 0.03  # 3 cm on a 2 m tree
+    assert up > 0.99
+
+
+def test_solve3d_many_views_fill_gaps_and_fix_fov(tmp_path):
+    xyz, normals = _cone_tree()
+    n = len(xyz)
+    yaws = [i * 2 * math.pi / 6 for i in range(6)]  # all the way round, 60 degrees apart
+    paths = _orbit_views(tmp_path, xyz, normals, yaws, fov=64.0, occlude=True, outliers=0.02)
+    docs = [json.load(open(q)) for q in paths]
+    good = [{f["pixel"] for f in d["found"]} - set(d["bad"]) for d in docs]
+    seen_by_two = sum(1 for p in range(n) if sum(p in g for g in good) >= 2)
+    out = tmp_path / "3d"
+    scale = str(np.linalg.norm(xyz[0] - xyz[-1]))
+    # --fov 70 is deliberately wrong (the "phone" is 64): the solver should find it
+    pixelmap.main(["solve3d", *paths, "--fov", "70", "--out", str(out), "--scale", "1", str(n), scale])
+    got = json.loads((out / "map.json").read_text())
+    assert len(got["views_used"]) == 6
+    assert len(got["found"]) >= 0.97 * seen_by_two
+    assert abs(got["fov"] - 64.0) < 1.0
+    err, up, _ = _shape_error(got, xyz)
+    assert err < 0.02
+    assert up > 0.99
 
 
 def test_export_madrix_and_resolume(tmp_path):

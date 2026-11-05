@@ -16,7 +16,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
-      - run: pip install pyyaml aiohttp pytest ruff numpy opencv-python-headless
+      - run: pip install pyyaml aiohttp pytest ruff numpy opencv-python-headless scipy
       - run: ruff check twinklybridge tests tools
       - run: pytest -q
       - run: python -m twinklybridge check -c twinklybridge/example-config.yaml

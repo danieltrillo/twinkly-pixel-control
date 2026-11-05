@@ -13,7 +13,7 @@ a pixel map for MADRIX 5 or Resolume Arena.
          python3 tools/pixelmap.py export map-front/map.json --universe 0.0.0 \
              --madrix madrix.csv --resolume twinkly.xml
 
-Needs numpy and OpenCV:  pip install numpy opencv-python-headless
+Needs numpy, OpenCV and (for 3D) scipy:  pip install numpy opencv-python-headless scipy
 Test without hardware:   python3 tools/pixelmap.py synth fake.mp4 --pixels 300
 """
 
@@ -378,42 +378,327 @@ def write_positions_csv(path: str, found: list[dict], dims: int) -> None:
 # ==========================================================================
 
 
+class View:
+    """One decoded clip: its 2D spots and, once registered, its camera pose."""
+
+    def __init__(self, doc: dict, name: str):
+        self.name = name
+        self.w, self.h = doc["image"]["width"], doc["image"]["height"]
+        self.pts = {f["pixel"]: (float(f["x"]), float(f["y"])) for f in doc["found"]}
+        self.rvec: np.ndarray | None = None
+        self.tvec: np.ndarray | None = None
+
+    def k(self, fov_deg: float) -> np.ndarray:
+        f = (max(self.w, self.h) / 2) / math.tan(math.radians(fov_deg) / 2)
+        return np.array([[f, 0, self.w / 2], [0, f, self.h / 2], [0, 0, 1]], np.float64)
+
+    @property
+    def registered(self) -> bool:
+        return self.rvec is not None
+
+    def projection(self, fov_deg: float) -> np.ndarray:
+        r = cv2.Rodrigues(self.rvec)[0]
+        return self.k(fov_deg) @ np.hstack([r, self.tvec.reshape(3, 1)])
+
+    def center(self) -> np.ndarray:
+        r = cv2.Rodrigues(self.rvec)[0]
+        return -r.T @ self.tvec.reshape(3)
+
+
+def _project(v: View, fov: float, xyz: np.ndarray) -> np.ndarray:
+    out, _ = cv2.projectPoints(xyz.reshape(-1, 1, 3), v.rvec, v.tvec, v.k(fov), None)
+    return out.reshape(-1, 2)
+
+
+def _triangulate(views: list[View], fov: float, pid: int) -> np.ndarray | None:
+    """Linear (DLT) triangulation of one pixel from every registered view that saw it."""
+    rows = []
+    for v in views:
+        if v.registered and pid in v.pts:
+            p = v.projection(fov)
+            x, y = v.pts[pid]
+            rows.append(x * p[2] - p[0])
+            rows.append(y * p[2] - p[1])
+    if len(rows) < 4:
+        return None
+    _, _, vt = np.linalg.svd(np.array(rows))
+    xh = vt[-1]
+    if abs(xh[3]) < 1e-12:
+        return None
+    return xh[:3] / xh[3]
+
+
+def _agreeing(views: list[View], fov: float, pid: int, xyz: np.ndarray, thr: float) -> list[View]:
+    """The views that see this point in front of them, within thr pixels of where they spotted it."""
+    out = []
+    for v in views:
+        if not (v.registered and pid in v.pts):
+            continue
+        r = cv2.Rodrigues(v.rvec)[0]
+        if (r @ xyz + v.tvec.reshape(3))[2] <= 0:
+            continue
+        if np.linalg.norm(_project(v, fov, xyz)[0] - v.pts[pid]) < thr:
+            out.append(v)
+    return out
+
+
+def _robust_point(views: list[View], fov: float, pid: int, thr: float) -> np.ndarray | None:
+    """Triangulate from every view; if a sighting is off, find the pair the most others agree with."""
+    seen = [v for v in views if v.registered and pid in v.pts]
+    if len(seen) < 2:
+        return None
+
+    def score(xyz):
+        ag = _agreeing(seen, fov, pid, xyz, thr)
+        err = sum(float(np.linalg.norm(_project(v, fov, xyz)[0] - v.pts[pid])) for v in ag)
+        return len(ag), -err, ag
+
+    best = None
+    xyz = _triangulate(seen, fov, pid)
+    if xyz is not None:
+        best = score(xyz)
+    if (best is None or len(best[2]) < len(seen)) and len(seen) >= 3:
+        for i in range(len(seen)):
+            for j in range(i + 1, len(seen)):
+                cand = _triangulate([seen[i], seen[j]], fov, pid)
+                if cand is not None:
+                    sc = score(cand)
+                    if best is None or sc[:2] > best[:2]:
+                        best = sc
+    if best is None or len(best[2]) < 2:
+        return None
+    return _triangulate(best[2], fov, pid)
+
+
+def _initial_pair(views: list[View], fov: float, thr: float):
+    """The pair with the most points that also has a real baseline."""
+    best = None
+    for i in range(len(views)):
+        for j in range(i + 1, len(views)):
+            a, b = views[i], views[j]
+            common = sorted(set(a.pts) & set(b.pts))
+            if len(common) < 20:
+                continue
+            ka, kb = a.k(fov), b.k(fov)
+            na = cv2.undistortPoints(np.array([a.pts[p] for p in common]).reshape(-1, 1, 2), ka, None).reshape(-1, 2)
+            nb = cv2.undistortPoints(np.array([b.pts[p] for p in common]).reshape(-1, 1, 2), kb, None).reshape(-1, 2)
+            e, inl = cv2.findEssentialMat(na, nb, np.eye(3), method=cv2.RANSAC, prob=0.999, threshold=thr / ka[0, 0])
+            if e is None:
+                continue
+            n_in, r, t, inl2 = cv2.recoverPose(e[:3], na, nb, np.eye(3), mask=inl)
+            # median angle between the two rays: tiny = no depth information
+            ra = np.hstack([na, np.ones((len(na), 1))])
+            rb = (r.T @ np.hstack([nb, np.ones((len(nb), 1))]).T).T
+            cosang = (ra * rb).sum(1) / np.linalg.norm(ra, axis=1) / np.linalg.norm(rb, axis=1)
+            parallax = math.degrees(float(np.median(np.arccos(np.clip(cosang[inl2.ravel() > 0], -1, 1)))))
+            score = n_in * min(1.0, parallax / 8.0)
+            if best is None or score > best[0]:
+                best = (score, i, j, r, t, parallax)
+    return best
+
+
+def _bundle_adjust(views, fov, points, thr, refine_fov, max_nfev=100, inliers=None):
+    """Refine every camera, every point and (optionally) the field of view together.
+
+    The first registered camera stays put so the solution can't wander off.
+    """
+    try:
+        from scipy.optimize import least_squares
+        from scipy.sparse import lil_matrix
+    except ImportError:  # pragma: no cover - message for humans
+        raise SystemExit("solve3d needs scipy: pip install scipy") from None
+
+    reg = [v for v in views if v.registered]
+    pids = sorted(points)
+    pindex = {p: k for k, p in enumerate(pids)}
+    obs = [
+        (ci, pindex[p], v.pts[p])
+        for ci, v in enumerate(reg)
+        for p in v.pts
+        if p in pindex and (inliers is None or v.name in inliers[p])
+    ]
+    cam_i = np.array([o[0] for o in obs])
+    pt_i = np.array([o[1] for o in obs])
+    uv = np.array([o[2] for o in obs])
+    nc, npt = len(reg), len(pids)
+    fixed = np.hstack([reg[0].rvec.reshape(3), reg[0].tvec.reshape(3)])
+    nf = 6 * (nc - 1)  # free camera parameters
+    x0 = np.concatenate(
+        [np.hstack([v.rvec.reshape(3), v.tvec.reshape(3)]) for v in reg[1:]]
+        + [np.array([points[p] for p in pids]).ravel()]
+        + ([np.array([fov])] if refine_fov else [])
+    )
+    sizes = np.array([[max(v.w, v.h) / 2, v.w / 2, v.h / 2] for v in reg])
+    sel_by_cam = [np.nonzero(cam_i == c)[0] for c in range(nc)]
+
+    def center(cam):
+        return -cv2.Rodrigues(cam[:3])[0].T @ cam[3:]
+
+    # scale is the other free direction: pin the distance between the first two cameras
+    base0 = float(np.linalg.norm(center(np.hstack([reg[1].rvec, reg[1].tvec])) - center(fixed))) if nc > 1 else 0.0
+
+    def unpack(x):
+        cams = np.vstack([fixed, x[:nf].reshape(nc - 1, 6)]) if nc > 1 else fixed.reshape(1, 6)
+        pts = x[nf : nf + 3 * npt].reshape(npt, 3)
+        fv = x[-1] if refine_fov else fov
+        return cams, pts, fv
+
+    def resid(x):
+        cams, pts, fv = unpack(x)
+        f_all = sizes[:, 0] / math.tan(math.radians(fv) / 2)
+        out = np.empty((len(obs), 2))
+        for c in range(nc):
+            sel = sel_by_cam[c]
+            r = cv2.Rodrigues(cams[c, :3])[0]
+            pc = pts[pt_i[sel]] @ r.T + cams[c, 3:]
+            z = np.where(np.abs(pc[:, 2]) < 1e-9, 1e-9, pc[:, 2])
+            out[sel, 0] = f_all[c] * pc[:, 0] / z + sizes[c, 1] - uv[sel, 0]
+            out[sel, 1] = f_all[c] * pc[:, 1] / z + sizes[c, 2] - uv[sel, 1]
+        if nc > 1:
+            gauge = 100.0 * (np.linalg.norm(center(cams[1]) - center(cams[0])) - base0) / max(base0, 1e-9)
+            return np.append(out.ravel(), gauge)
+        return out.ravel()
+
+    sp = lil_matrix((len(obs) * 2 + (1 if nc > 1 else 0), len(x0)), dtype=int)
+    rows = np.arange(len(obs))
+    moving = cam_i > 0
+    for s_ in range(6):
+        cols = (cam_i[moving] - 1) * 6 + s_
+        sp[2 * rows[moving], cols] = 1
+        sp[2 * rows[moving] + 1, cols] = 1
+    for s_ in range(3):
+        sp[2 * rows, nf + pt_i * 3 + s_] = 1
+        sp[2 * rows + 1, nf + pt_i * 3 + s_] = 1
+    if refine_fov:
+        sp[: len(obs) * 2, -1] = 1
+    if nc > 1:
+        sp[len(obs) * 2, 0:6] = 1
+    # plain least squares: robust losses crawl on this problem; outliers are pruned between rounds instead
+    res = least_squares(resid, x0, jac_sparsity=sp, x_scale="jac", max_nfev=max_nfev)
+    cams, pts, fv = unpack(res.x)
+    for c, v in enumerate(reg):
+        v.rvec, v.tvec = cams[c, :3].copy(), cams[c, 3:].copy()
+    return {p: pts[pindex[p]] for p in pids}, float(fv)
+
+
+def _reconstruct(docs, names, fov, thr, fix_fov, log=print):
+    """Place every camera and triangulate every pixel. Returns (views, points, inliers, fov) or None."""
+    views = [View(d, nm) for d, nm in zip(docs, names, strict=True)]
+    init = _initial_pair(views, fov, thr)
+    if init is None:
+        return None
+    _, i, j, r, t, parallax = init
+    views[i].rvec, views[i].tvec = np.zeros(3), np.zeros(3)
+    views[j].rvec, views[j].tvec = cv2.Rodrigues(r)[0].reshape(3), t.reshape(3)
+    log(f"start: {views[i].name} + {views[j].name} ({parallax:.0f} degrees apart)")
+    points: dict[int, np.ndarray] = {}
+    inliers: dict[int, set[str]] = {}  # which views' sightings of a pixel agree; the rest sit out
+
+    def retriangulate(min_views=2):
+        points.clear()
+        inliers.clear()
+        seen = set().union(*(v.pts.keys() for v in views if v.registered))
+        for pid in seen:
+            xyz = _robust_point(views, fov, pid, 3 * thr)
+            if xyz is None:
+                continue
+            ag = _agreeing(views, fov, pid, xyz, 3 * thr)
+            if len(ag) >= min_views:
+                points[pid] = xyz
+                inliers[pid] = {v.name for v in ag}
+
+    retriangulate()
+    # add the other views one by one: the one that sees most solved points first
+    while True:
+        todo = [v for v in views if not v.registered]
+        if not todo:
+            break
+        v = max(todo, key=lambda q: len(set(q.pts) & set(points)))
+        common = sorted(set(v.pts) & set(points))
+        if len(common) < 12:
+            log(f"  skipped {v.name}: only {len(common)} pixels in common with the solved ones")
+            break
+        ok, rvec, tvec, inl = cv2.solvePnPRansac(
+            np.array([points[p] for p in common]),
+            np.array([v.pts[p] for p in common]),
+            v.k(fov),
+            None,
+            reprojectionError=3 * thr,
+            iterationsCount=500,
+        )
+        if not ok or inl is None or len(inl) < 10:
+            log(f"  skipped {v.name}: couldn't place the camera")
+            break
+        v.rvec, v.tvec = rvec.reshape(3), tvec.reshape(3)
+        log(f"  added {v.name} ({len(inl)}/{len(common)} pixels agree)")
+        retriangulate()
+        if len(points) >= 8:
+            points_ba, fov = _bundle_adjust(views, fov, points, thr, refine_fov=False, max_nfev=30, inliers=inliers)
+            points.update(points_ba)
+    # final: refine everything (and the field of view when there's enough to pin it down)
+    # the field of view is only pinned down by pixels seen from three or more angles
+    multi = sum(1 for p in points if len(inliers[p]) >= 3)
+    refine = not fix_fov and multi >= 30
+    if not fix_fov and not refine:
+        log(f"  keeping --fov {fov:g}: only {multi} pixels seen from 3+ angles (film angles closer together)")
+    for _ in range(3):
+        pts_ba, fov = _bundle_adjust(views, fov, points, thr, refine_fov=refine, max_nfev=500, inliers=inliers)
+        points.update(pts_ba)
+        retriangulate()
+    return views, points, inliers, fov
+
+
 def cmd_solve3d(a) -> int:
-    m1, m2 = (json.load(open(p)) for p in (a.view1, a.view2))
-    p1 = {f["pixel"]: (f["x"], f["y"]) for f in m1["found"]}
-    p2 = {f["pixel"]: (f["x"], f["y"]) for f in m2["found"]}
-    common = sorted(set(p1) & set(p2))
-    if len(common) < 12:
-        raise SystemExit(f"only {len(common)} pixels seen in both views; need at least 12 (aim for 100+)")
-    k1, k2 = _intrinsics(m1, a.fov), _intrinsics(m2, a.fov)
-    x1 = np.array([p1[i] for i in common], np.float64)
-    x2 = np.array([p2[i] for i in common], np.float64)
-    n1 = cv2.undistortPoints(x1.reshape(-1, 1, 2), k1, None).reshape(-1, 2)
-    n2 = cv2.undistortPoints(x2.reshape(-1, 1, 2), k2, None).reshape(-1, 2)
-    e, inl = cv2.findEssentialMat(n1, n2, np.eye(3), method=cv2.RANSAC, prob=0.999, threshold=a.ransac / k1[0, 0])
-    if e is None:
-        raise SystemExit("couldn't relate the two views - film from angles 30-60 degrees apart")
-    _, r, t, inl2 = cv2.recoverPose(e[:3], n1, n2, np.eye(3), mask=inl)
-    good = inl2.ravel() > 0
-    pa = np.hstack([np.eye(3), np.zeros((3, 1))])
-    pb = np.hstack([r, t])
-    xh = cv2.triangulatePoints(pa, pb, n1.T, n2.T)
-    xyz = (xh[:3] / xh[3]).T
-    # reprojection error in pixels, view 1
-    rep = np.linalg.norm((xyz[:, :2] / xyz[:, 2:3]) - n1, axis=1) * k1[0, 0]
-    good &= (xyz[:, 2] > 0) & (rep < 3 * a.ransac)
-    xyz = xyz[good]
-    ids = [c for c, g in zip(common, good, strict=True) if g]
-    if len(ids) < 8:
-        raise SystemExit("too few consistent pixels after triangulation; try another --fov or better angles")
-    xyz = _upright(xyz)
+    if len(a.views) < 2:
+        raise SystemExit("solve3d needs at least two decoded views")
+    docs = [json.load(open(p)) for p in a.views]
+    names = [os.path.basename(os.path.dirname(os.path.abspath(p))) or p for p in a.views]
+    names = [f"{nm}#{k + 1}" if names.count(nm) > 1 else nm for k, nm in enumerate(names)]  # must be unique
+    n = docs[0]["pixels"]
+    thr = a.ransac
+    fov = a.fov
+    if fov is None:
+        # a wrong field of view can break the chain of cameras, so try a few phone-like ones first
+        def quiet(*_):
+            pass
+
+        trials = []
+        for cand in (50.0, 60.0, 70.0, 80.0):
+            got = _reconstruct(docs, names, cand, thr, True, log=quiet)
+            if got:
+                trials.append((len(got[1]), -cand if cand != 70.0 else 0, cand))  # ties go to 70
+        if not trials:
+            raise SystemExit("no two views share enough pixels; film from angles 30-60 degrees apart with overlap")
+        fov = max(trials)[2]
+        print(f"starting field of view {fov:g} degrees (tried 50-80; pass --fov if you know it)")
+    got = _reconstruct(docs, names, fov, thr, a.fix_fov)
+    if got is None:
+        raise SystemExit("no two views share enough pixels; film from angles 30-60 degrees apart with overlap")
+    views, points, inliers, fov = got
+    reg = [v for v in views if v.registered]
+    if len(reg) >= 3 and sum(len(inliers[p]) >= 3 for p in points) < 0.1 * max(len(points), 1):
+        print(
+            "  warning: almost every pixel was seen from only two angles, so the cameras barely tie"
+            " together. Film more angles, 45 degrees apart or closer."
+        )
+    # sightings that disagree with the rest: a mirrored strand, a reflection, a mis-decode
+    pruned = sum(1 for v in reg for p in v.pts if p in points and v.name not in inliers[p])
+    pids = sorted(points)
+    xyz = np.array([points[p] for p in pids])
+    counts = [len(inliers[p]) for p in pids]
+    errs = [
+        float(
+            np.median([np.linalg.norm(_project(v, fov, points[p])[0] - v.pts[p]) for v in reg if v.name in inliers[p]])
+        )
+        for p in pids
+    ]
+    xyz = _upright(xyz, reg)
     unit = "relative"
     if a.scale:
         ia, ib, meters = int(a.scale[0]) - 1, int(a.scale[1]) - 1, float(a.scale[2])
-        if ia not in ids or ib not in ids:
+        if ia not in pids or ib not in pids:
             raise SystemExit("--scale pixels weren't both triangulated; pick two others")
-        dist = np.linalg.norm(xyz[ids.index(ia)] - xyz[ids.index(ib)])
-        xyz *= meters / dist
+        xyz *= meters / np.linalg.norm(xyz[pids.index(ia)] - xyz[pids.index(ib)])
         unit = "m"
     found = [
         {
@@ -421,19 +706,22 @@ def cmd_solve3d(a) -> int:
             "x": round(float(v[0]), 4),
             "y": round(float(v[1]), 4),
             "z": round(float(v[2]), 4),
+            "views": c,
+            "error_px": round(e, 2),
             "duplicates": [],
         }
-        for p, v in zip(ids, xyz, strict=True)
+        for p, v, c, e in zip(pids, xyz, counts, errs, strict=True)
     ]
-    n = m1["pixels"]
-    seen = set(ids)
+    seen = set(pids)
     doc = {
         "kind": "twinkly-pixelmap",
         "version": 1,
         "dims": 3,
         "unit": unit,
         "pixels": n,
-        "source": [m1["source"], m2["source"]],
+        "fov": round(fov, 2),
+        "source": [v.name for v in views],
+        "views_used": [v.name for v in reg],
         "found": found,
         "missing": [i for i in range(n) if i not in seen],
     }
@@ -442,22 +730,31 @@ def cmd_solve3d(a) -> int:
         json.dump(doc, fh, indent=1)
     write_positions_csv(os.path.join(a.out, "map.csv"), found, dims=3)
     print(
-        f"3D: {len(ids)}/{n} pixels (seen in both views and consistent), median reprojection"
-        f" {np.median(rep[good]):.2f} px, units {unit} -> {a.out}/map.json"
+        f"3D: {len(pids)}/{n} pixels from {len(reg)}/{len(views)} views, median reprojection"
+        f" {np.median(errs):.2f} px, fov {fov:.1f} degrees, {pruned} odd sightings dropped, units {unit}"
+        f" -> {a.out}/map.json"
     )
     return 0
 
 
-def _intrinsics(m: dict, fov_deg: float) -> np.ndarray:
-    w, h = m["image"]["width"], m["image"]["height"]
-    f = (max(w, h) / 2) / math.tan(math.radians(fov_deg) / 2)
-    return np.array([[f, 0, w / 2], [0, f, h / 2], [0, 0, 1]], np.float64)
-
-
-def _upright(xyz: np.ndarray) -> np.ndarray:
-    """Camera 1 looks down +Z with Y down. Re-express as X right, Y up, Z toward camera 1, centred."""
-    out = np.stack([xyz[:, 0], -xyz[:, 1], -xyz[:, 2]], axis=1)
-    return out - np.median(out, axis=0)
+def _upright(xyz: np.ndarray, views: list[View]) -> np.ndarray:
+    """X right, Y up, Z toward the first camera, centred. 'Up' is the cameras' average up."""
+    ups, first = [], None
+    for v in views:
+        r = cv2.Rodrigues(v.rvec)[0]
+        ups.append(r.T @ np.array([0.0, -1.0, 0.0]))  # camera Y runs down
+        if first is None:
+            first = v.center()
+    y = np.mean(ups, axis=0)
+    y /= np.linalg.norm(y)
+    mid = np.median(xyz, axis=0)
+    z = first - mid
+    z -= y * (z @ y)
+    if np.linalg.norm(z) < 1e-9:
+        z = np.cross(y, [1.0, 0, 0])
+    z /= np.linalg.norm(z)
+    x = np.cross(y, z)
+    return (xyz - mid) @ np.stack([x, y, z], axis=1)
 
 
 # ==========================================================================
@@ -809,12 +1106,14 @@ def main(argv=None) -> int:
     d.add_argument("--min-contrast", type=float, default=20.0, help="minimum on-minus-off brightness (0-255)")
     d.add_argument("--min-margin", type=float, default=0.3, help="how clear every bit must be (0-1)")
 
-    s3 = sub.add_parser("solve3d", help="two decoded views -> 3D positions")
-    s3.add_argument("view1")
-    s3.add_argument("view2")
+    s3 = sub.add_parser("solve3d", help="two or more decoded views -> 3D positions")
+    s3.add_argument("views", nargs="+", help="map.json from each angle (2 minimum, 4-8 is better)")
     s3.add_argument("--out", default="pixelmap-3d")
-    s3.add_argument("--fov", type=float, default=70.0, help="camera field of view across the long side, degrees")
+    s3.add_argument(
+        "--fov", type=float, default=None, help="camera field of view across the long side, degrees (default: search)"
+    )
     s3.add_argument("--ransac", type=float, default=2.0, help="outlier threshold in pixels")
+    s3.add_argument("--fix-fov", action="store_true", help="trust --fov instead of refining it (3+ views)")
     s3.add_argument(
         "--scale", nargs=3, metavar=("PIXEL_A", "PIXEL_B", "METERS"), help="known distance between two pixels"
     )

@@ -213,7 +213,7 @@ bracket the code and set the timing. One pass takes about 18 s.
 
        python3 tools/twinkly_probe.py scan <controller-ip>
 
-3. Decode the video (needs `pip install numpy opencv-python-headless`):
+3. Decode the video (needs `pip install numpy opencv-python-headless scipy`):
 
        python3 tools/pixelmap.py decode scan.mp4 --pixels 1440 --out front
 
@@ -222,15 +222,24 @@ bracket the code and set the timing. One pass takes about 18 s.
    top of each other from this angle, or are hidden, are listed as missing.
    Pixels mirrored by a Y-splitter show up as a second spot (an x in the preview).
 
-4. **3D (optional).** Film a second pass from 30-60 degrees around the rig,
-   decode it, then:
+4. **3D (optional).** Walk around the rig and film the scan from more angles,
+   about 45 degrees apart (6-8 clips all the way round is ideal), each from a
+   tripod. Decode each clip, then hand them all to `solve3d`:
 
-       python3 tools/pixelmap.py decode side.mp4 --pixels 1440 --out side
-       python3 tools/pixelmap.py solve3d front/map.json side/map.json --out tree3d --scale 1 240 1.8
+       python3 tools/pixelmap.py decode a.mp4 --pixels 1440 --out a   # and b, c, d ...
+       python3 tools/pixelmap.py solve3d a/map.json b/map.json c/map.json d/map.json \
+           --out tree3d --scale 1 240 1.8
+
+   Every clip counts. The solver places each camera, triangulates every pixel
+   from all the angles that saw it, throws out sightings the others disagree
+   with (reflections, splitter mirrors), then refines everything together,
+   including the lens field of view. More angles = fewer hidden pixels and
+   tighter positions. Two angles work but can't fix a wrong `--fov` and leave
+   the back side unmapped. Angles 90 degrees apart barely overlap: stay at 60
+   or closer.
 
    `--scale A B METERS` sets real size from two pixels you measured. Without
-   it the units are relative. `--fov` is the phone camera's field of view
-   across the long side (70 for most main lenses).
+   it the units are relative.
 
 5. **Export** with the same patch as the bridge (or `--universe 0.0.0`):
 
