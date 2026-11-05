@@ -48,7 +48,9 @@ python3 tools/twinkly_probe.py info 10.20.30.101
 python3 tools/twinkly_probe.py test 10.20.30.101
 ```
 
-`test` flashes red, green, blue and then the white chip only. Next it lights
+It finds the API generation by itself (consumer `/xled/v1` or Pro firmware
+4.x `/xled/v2`) and stops with a clear message if the controller is a group
+slave. `test` flashes red, green, blue and then the white chip only. Next it lights
 the first pixel, then the last pixel, then sends a walking dot and a rainbow.
 After each step it asks what you saw. If colours come out wrong, try
 `--order RGBW` (the default is `WRGB`, which is what Twinkly documents for

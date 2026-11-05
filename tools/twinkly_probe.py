@@ -4,6 +4,7 @@ twinkly_probe.py - Step 1 test: can we drive a Twinkly controller pixel-by-pixel
 
 Uses Twinkly's local (unofficial, community-documented) API:
   HTTP  :80   /xled/v1/...   login, device info, set mode "rt"
+              /xled/v2/...   the same on Twinkly Pro firmware 4.x (found automatically)
   UDP   :7777                realtime pixel frames
 
 Python 3.8+ standard library only. No installs needed.
@@ -30,14 +31,32 @@ FRAGMENT_BYTES = 900  # max pixel bytes per UDP datagram (protocol v3)
 
 
 # ----------------------------------------------------------------- HTTP API --
+class NotFound(RuntimeError):
+    """The endpoint does not exist on this firmware."""
+
+
+def code(reply):
+    """v1 replies carry {"code": 1000}; v2 (Pro firmware 4.x) carry {"result": {"code": 1000}}."""
+    if "code" in reply:
+        return reply["code"]
+    result = reply.get("result")
+    return result.get("code") if isinstance(result, dict) else None
+
+
 class Twinkly:
     def __init__(self, ip, http_port=80, udp_port=UDP_PORT, timeout=3):
         self.ip = ip
-        self.base = f"http://{ip}:{http_port}/xled/v1"
+        self.root = f"http://{ip}:{http_port}/xled"
+        self.api = None  # "v1" (consumer, older Pro) or "v2" (Pro firmware 4.x); found by detect()
         self.udp_addr = (ip, udp_port)
         self.timeout = timeout
         self.token = None  # base64 string, used in HTTP header
         self.token_raw = None  # 8 raw bytes, used in UDP packets
+        self.gestalt = None
+
+    @property
+    def base(self):
+        return f"{self.root}/{self.api or 'v1'}"
 
     def _req(self, method, path, body=None, auth=True):
         headers = {"Content-Type": "application/json"}
@@ -49,6 +68,8 @@ class Twinkly:
             with urllib.request.urlopen(req, timeout=self.timeout) as r:
                 raw = r.read()
         except urllib.error.HTTPError as e:
+            if e.code == 404:
+                raise NotFound(f"{method} {path} -> not on this firmware (HTTP 404)") from None
             raise RuntimeError(f"{method} {path} -> HTTP {e.code}: {e.read()[:200]!r}") from None
         except (TimeoutError, urllib.error.URLError, OSError) as e:
             raise RuntimeError(f"{method} {path} -> can't reach {self.ip} ({e})") from None
@@ -63,7 +84,32 @@ class Twinkly:
     def post(self, path, body, auth=True):
         return self._req("POST", path, body, auth=auth)
 
+    def detect(self):
+        """Find which API generation answers; returns the gestalt."""
+        if self.gestalt is not None:
+            return self.gestalt
+        for api in ("v1", "v2"):
+            self.api = api
+            try:
+                self.gestalt = self.get("/gestalt", auth=False)
+                return self.gestalt
+            except NotFound:
+                continue
+        self.api = None
+        raise RuntimeError(f"{self.ip} answers HTTP but has no /xled/v1 or /xled/v2 gestalt; is it a Twinkly?")
+
+    # Endpoint names that differ between the two generations. v2 was verified
+    # on a TWPROCTRLPLC21 with firmware 4.0.1.
+    @property
+    def mode_path(self):
+        return "/application/mode" if self.api == "v2" else "/led/mode"
+
+    @property
+    def fw_path(self):
+        return "/fw/ct1/version" if self.api == "v2" else "/fw/version"
+
     def login(self):
+        self.detect()
         challenge = base64.b64encode(os.urandom(32)).decode()
         r = self.post("/login", {"challenge": challenge}, auth=False)
         if "authentication_token" not in r:
@@ -71,13 +117,44 @@ class Twinkly:
         self.token = r["authentication_token"]
         self.token_raw = base64.b64decode(self.token)
         v = self.post("/verify", {"challenge-response": r.get("challenge-response", "")})
-        if v.get("code") != 1000:
+        if code(v) != 1000:
             raise RuntimeError(f"verify failed: {v}")
 
+    def get_mode(self):
+        """Current mode, or "" when the firmware doesn't expose it."""
+        try:
+            return str(self.get(self.mode_path).get("mode", ""))
+        except NotFound:
+            return ""
+
     def set_mode(self, mode):
-        r = self.post("/led/mode", {"mode": mode})
-        if r.get("code") != 1000:
+        try:
+            r = self.post(self.mode_path, {"mode": mode})
+        except RuntimeError as e:
+            if "HTTP 403" in str(e):
+                raise RuntimeError(
+                    f"set mode {mode!r} refused (403). On Pro firmware this means the controller is a group "
+                    "slave; take it out of its group in the Twinkly Pro app and run this again"
+                ) from None
+            raise
+        if code(r) != 1000:
             raise RuntimeError(f"set mode {mode!r} failed: {r}")
+
+
+def device_config(g):
+    cfg = g.get("device_config")
+    return cfg if isinstance(cfg, dict) else {}
+
+
+def profile_of(g):
+    """led_profile is top-level on v1 and under device_config on Pro v2."""
+    return str(g.get("led_profile") or device_config(g).get("led_profile") or "RGB").upper()
+
+
+def group_of(g):
+    """(mode, group dict). Pro v2 only; mode is "" elsewhere."""
+    group = g.get("group") if isinstance(g.get("group"), dict) else {}
+    return str(group.get("mode", "")), group
 
 
 # ------------------------------------------------------------- UDP frames ---
@@ -91,6 +168,8 @@ def version_tuple(v):
 
 def pick_protocol(fw_version):
     """v3 (fragmented) for fw >= 2.4.14, v2 for older gen II, else v1."""
+    if not any(ch.isdigit() for ch in str(fw_version)):
+        return 3  # firmware that hides its version is new enough for v3
     v = version_tuple(fw_version)
     if v >= (2, 4, 14):
         return 3
@@ -165,16 +244,21 @@ def hsv(h):
 
 
 def show_info(dev):
-    fw = dev.get("/fw/version", auth=False)
-    g = dev.get("/gestalt", auth=False)
-    print(f"\n== Twinkly @ {dev.ip} ==")
-    print(f"  firmware        : {fw.get('version', '?')}")
+    g = dev.detect()
+    try:
+        fw = str(dev.get(dev.fw_path, auth=False).get("version", "?"))
+    except NotFound:
+        fw = "n/a"
+    flat = {**device_config(g), **g}  # Pro v2 keeps led_profile etc. under device_config
+    print(f"\n== Twinkly @ {dev.ip} (API {dev.api}) ==")
+    print(f"  firmware        : {fw}")
     for k in (
         "product_code",
         "device_name",
         "fw_family",
         "hardware_version",
         "led_profile",
+        "led_drv",
         "bytes_per_led",
         "number_of_led",
         "max_supported_led",
@@ -182,24 +266,36 @@ def show_info(dev):
         "measured_frame_rate",
         "wire_type",
         "mac",
+        "artnet_en",
     ):
-        if k in g:
-            print(f"  {k:<16}: {g[k]}")
+        if k in flat:
+            print(f"  {k:<16}: {flat[k]}")
+    group_mode, group = group_of(g)
+    if group_mode:
+        print(f"  group           : {group_mode} (size {group.get('size')}, offset {group.get('offset')})")
+    if group_mode == "slave":
+        print("  !! group slave  : Pro firmware refuses realtime until the controller leaves its group")
     try:
         dev.login()
-        mode = dev.get("/led/mode")
-        cfg = dev.get("/led/config")
-        print(f"  current mode    : {mode.get('mode', mode)}")
-        strings = cfg.get("strings", [])
-        if strings:
-            print(f"  outputs/strings : {len(strings)}")
-            for i, s in enumerate(strings):
-                print(f"    port {i + 1}: first_led={s.get('first_led_id')} length={s.get('length')}")
+        print(f"  current mode    : {dev.get_mode() or 'n/a'}")
+        if dev.api == "v1":
+            strings = dev.get("/led/config").get("strings", [])
+            if strings:
+                print(f"  outputs/strings : {len(strings)}")
+                for i, st in enumerate(strings):
+                    print(f"    port {i + 1}: first_led={st.get('first_led_id')} length={st.get('length')}")
+        else:
+            ports = device_config(g).get("ports", [])
+            if ports:
+                print(f"  ports           : {len(ports)}")
+                for port in ports:
+                    runs = ", ".join(f"start={st.get('start')} len={st.get('len')}" for st in port.get("strings", []))
+                    print(f"    port {port.get('port_id')}: {runs}")
     except RuntimeError as e:
         print(f"  (login/extra info failed: {e})")
     print("\n  raw gestalt (paste this back if something looks off):")
     print("  " + json.dumps(g))
-    return fw.get("version", "0"), g
+    return fw, g
 
 
 def ask(prompt):
@@ -213,14 +309,16 @@ def ask(prompt):
 def run_test(dev, fps, order, proto_override, auto_yes):
     fw, g = show_info(dev)
     n = int(g.get("number_of_led", 0))
-    profile = str(g.get("led_profile", "RGB")).upper()
+    profile = profile_of(g)
     if n <= 0:
         sys.exit("Controller reports 0 LEDs - check it in the Twinkly app.")
+    if group_of(g)[0] == "slave":
+        sys.exit("Controller is a group slave; Pro firmware refuses realtime. Take it out of its group first.")
     proto = proto_override or pick_protocol(fw)
     s = Streamer(dev, n, profile, proto, order)
     print(f"\n  streaming {n} px, profile {profile}, byte order {s.order}, UDP protocol v{proto}, target {fps} fps")
 
-    prev_mode = dev.get("/led/mode").get("mode", "movie")
+    prev_mode = dev.get_mode() or "movie"
     dev.set_mode("rt")
     results = {}
     black = [(0, 0, 0, 0)] * n
