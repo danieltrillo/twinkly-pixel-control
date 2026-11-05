@@ -106,10 +106,19 @@ def cmd_info(args: argparse.Namespace) -> int:
         return 1
     i = r["info"]
     print(f"{args.ip}: {i.product_code or 'Twinkly'} '{i.device_name}'")
-    print(f"  firmware   {i.firmware} (family {i.fw_family or '?'})")
+    print(f"  API        /xled/{i.api}")
+    print(f"  firmware   {i.firmware or 'n/a (not exposed by this firmware)'}")
     print(f"  LEDs       {i.number_of_led} {i.led_profile} (max {i.max_supported_led})")
     print(f"  frame rate {i.frame_rate} (measured {i.measured_frame_rate})")
-    print(f"  mode       {r['mode']}")
+    print(f"  mode       {r['mode'] or 'n/a (not exposed by this firmware)'}")
+    if i.group_mode:
+        print(
+            f"  group      {i.group_mode}, pixels {i.group_offset}-{i.group_offset + i.number_of_led} of {i.group_size}"
+        )
+    if i.artnet_enabled is not None:
+        print(
+            f"  Art-Net    built-in DMX mode {'ON (turn off so it does not fight the bridge)' if i.artnet_enabled else 'off'}"
+        )
     for n, s in enumerate(r["strings"], start=1):
         print(f"  output {n}   first LED {s.get('first_led_id')}, {s.get('length')} LEDs")
     return 0
@@ -141,7 +150,7 @@ def cmd_discover(args: argparse.Namespace) -> int:
                 print(f"{d.ip:<15} {d.name:<24} ? ({err})")
             else:
                 print(
-                    f"{d.ip:<15} {d.name:<24} {info.product_code:<16} fw {info.firmware:<8} "
+                    f"{d.ip:<15} {d.name:<24} {info.product_code:<16} fw {info.firmware or 'n/a':<8} "
                     f"{info.number_of_led:>5} {info.led_profile}"
                 )
         print(f"{len(rows)} device(s)", file=sys.stderr)
@@ -163,7 +172,10 @@ def cmd_discover(args: argparse.Namespace) -> int:
         print(
             f"    universe: {format_universe(ARTNET, universe)}   # to {format_universe(ARTNET, last)}, {len(segs)} universes"
         )
-        print(f"    pixels: {pixels}   # {info.product_code} fw {info.firmware}, {info.led_profile}")
+        print(
+            f"    pixels: {pixels}   # {info.product_code}, {info.led_profile}"
+            + (f", fw {info.firmware}" if info.firmware else "")
+        )
         universe = last + 1
     return 0
 
