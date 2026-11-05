@@ -24,18 +24,19 @@ uses for mapping.
 It runs on Linux, macOS or a Pi with Python 3.11+. It needs two libraries
 (`PyYAML`, `aiohttp`) and no special privileges.
 
-> **Status:** v0.1. It's tested against a simulated controller. The realtime
+> **Status:** v0.1, **verified on a Twinkly Pro** (TWPROCTRLPLC21, firmware
+> 4.0.1, 1440 RGBW pixels on 6 ports) on 2026-11-05: colour order, first and
+> last pixel, a walking dot and a rainbow all came out right, both from the
+> hardware probe and through the bridge from Art-Net (12 universes at 20 fps,
+> no send errors, clean hand-back to the movie it was playing). The realtime
 > protocol is unofficial and community documented
 > ([xled-docs](https://xled-docs.readthedocs.io/en/latest/protocol_details.html)),
-> so step 1 below matters.
+> so step 1 below still matters on other firmware.
 >
-> **Twinkly Pro firmware 4.x** (TWPROCTRLPLC21, fw 4.0.1) was probed with the
-> bridge: it only speaks `/xled/v2`, which the bridge detects and uses
-> (`application/mode`, `fw/ct1/version`, nested result codes). One catch found
-> so far: while a Pro controller is a **slave in a group**, the firmware refuses
-> every output write with HTTP 403, realtime included. Take the controller out
-> of its group in the Twinkly Pro app before streaming to it. Realtime frames on
-> an ungrouped Pro controller are still to be confirmed on hardware.
+> **Twinkly Pro firmware 4.x** only speaks `/xled/v2`; the bridge detects that
+> and uses the v2 names (`application/mode`, `fw/ct1/version`, nested result
+> codes, login before anything else). Two things must be done on every Pro
+> controller before a show; see [Before the show](#before-the-show).
 
 ## Step 1: prove one controller
 
@@ -55,6 +56,24 @@ the first pixel, then the last pixel, then sends a walking dot and a rainbow.
 After each step it asks what you saw. If colours come out wrong, try
 `--order RGBW` (the default is `WRGB`, which is what Twinkly documents for
 RGBW). At the end it hands the controller back to whatever it was playing.
+Add `--yes --hold 6` to run the whole sequence without prompts, six seconds
+per step with a second of black between, which suits one person at the
+keyboard and another watching the strands.
+
+## Before the show
+
+On every Twinkly Pro controller:
+
+1. **Take it out of its group** in the Twinkly Pro app. A controller that is
+   a slave in a group refuses every output write with HTTP 403, realtime
+   included. `twinkly-bridge info <ip>` shows the group state, and the status
+   page warns about it.
+2. **Turn off the built-in Art-Net/DMX mode** (the 10-channel fixture) so it
+   doesn't fight the bridge for the output. `info` shows whether it's on.
+3. Know that on firmware 4.0.1 rt mode does not time out by itself. The bridge
+   hands each controller back to its previous mode when it stops, but if the
+   bridge is killed outright the controller may sit in rt mode showing the
+   last frame. Pick a movie in the app to get it back.
 
 ## Install
 
@@ -212,6 +231,7 @@ controller does.
 | Low fps out | Look at "send errors" on the status page. Twinkly renders about 24 fps, so above that frames are dropped by the controller. |
 | Pixel count warning | The controller reports a different LED count than `pixels:`. The bridge sends what the controller reports. |
 | **set mode 'rt' refused (403)** or a "group slave" warning | Pro firmware: the controller is a slave in a group and refuses all output writes. Take it out of its group in the Twinkly Pro app. |
+| Controller stuck on the last frame after the bridge died | It's still in rt mode (Pro firmware doesn't time out). Pick a movie in the app, or start the bridge again and stop it cleanly. |
 
 ## Not in this version
 
