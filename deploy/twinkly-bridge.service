@@ -1,0 +1,31 @@
+[Unit]
+Description=Twinkly Bridge (Art-Net / sACN to Twinkly realtime pixels)
+Documentation=https://github.com/danieltrillo/twinkly-pixel-control
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=twinkly-bridge
+Group=twinkly-bridge
+WorkingDirectory=/opt/twinkly-bridge
+Environment=PYTHONPATH=/opt/twinkly-bridge
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 -m twinklybridge run -c /etc/twinkly-bridge/config.yaml
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=2
+# Give the bridge time to hand every controller back to its own effect.
+TimeoutStopSec=15
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadOnlyPaths=/etc/twinkly-bridge
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=multi-user.target
