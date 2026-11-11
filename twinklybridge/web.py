@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+import logging
 import os
 import pathlib
 import time
@@ -16,7 +17,7 @@ from . import configstore, mapping
 from .config import MAP_COLORS, ConfigError, parse_config
 from .engine import DeviceRunner, ScanError
 from .mapstore import StoreError
-from .twinkly import HTTP_PORT, Discovered, TwinklyClient, TwinklyError, discover, local_networks
+from .twinkly import HTTP_PORT, Discovered, NotFound, TwinklyClient, TwinklyError, discover, local_networks
 
 if TYPE_CHECKING:
     from .app import Supervisor
@@ -25,6 +26,7 @@ PAGE = pathlib.Path(__file__).parent / "status.html"
 MAP_PAGE = pathlib.Path(__file__).parent / "mapping.html"
 SETUP_PAGE = pathlib.Path(__file__).parent / "setup.html"
 NO_CACHE = {"Cache-Control": "no-cache"}
+log = logging.getLogger(__name__)
 
 
 async def index(request: web.Request) -> web.FileResponse:
@@ -286,6 +288,14 @@ async def _json_body(request: web.Request) -> dict | None:
     return body if isinstance(body, dict) else None
 
 
+def _running(dev: DeviceRunner) -> dict:
+    return {
+        "state": dev.state,
+        "ip": dev.cfg.ip,
+        "artnet": dev.info.artnet_enabled if dev.info is not None else None,
+    }
+
+
 def _setup_state(sup: Supervisor) -> dict:
     try:
         raw = configstore.load_raw(sup.config_path)
@@ -296,7 +306,7 @@ def _setup_state(sup: Supervisor) -> dict:
     if file_error:
         state["error"] = file_error
     state["reload_error"] = sup.config_error
-    state["running"] = {d.name: d.state for d in sup.engine.devices} if sup.engine is not None else {}
+    state["running"] = {d.name: _running(d) for d in sup.engine.devices} if sup.engine is not None else {}
     state["networks"] = local_networks()
     return state
 
@@ -447,6 +457,49 @@ async def api_setup_discover(request: web.Request) -> web.Response:
     return web.json_response({"ok": True, "targets": targets, "devices": list(rows)})
 
 
+async def api_setup_artnet(request: web.Request) -> web.Response:
+    """Switch a controller's built-in Art-Net mode off (or on). A persistent change on the controller."""
+    import aiohttp
+
+    sup: Supervisor = request.app["supervisor"]
+    body = await _json_body(request)
+    if body is None:
+        return _fail("expected JSON")
+    ip = str(body.get("ip") or "").strip()
+    try:
+        ipaddress.IPv4Address(ip)
+        port = int(body.get("port") or HTTP_PORT)
+    except ValueError:
+        return _fail("send ip (IPv4) and optionally port")
+    enable = body.get("enable")
+    if not isinstance(enable, bool):
+        return _fail("enable must be true or false")
+    runner = None
+    if sup.engine is not None:
+        runner = next((d for d in sup.engine.devices if d.cfg.ip == ip), None)
+    client = getattr(runner, "client", None)
+    if client is not None and client.token:
+        session = None  # the bridge's own session and token: no second login on a streaming controller
+    else:
+        session = aiohttp.ClientSession()
+        client = TwinklyClient(session, ip, port=port, timeout=5.0)
+    try:
+        if session is not None:
+            await client.login()
+        after = await client.set_artnet(enable)
+    except NotFound:
+        return _fail(f"{ip}: this firmware has no built-in Art-Net setting (consumer device?)", 400)
+    except TwinklyError as exc:
+        return _fail(f"{ip}: {exc}", 502)
+    finally:
+        if session is not None:
+            await session.close()
+    if runner is not None and runner.info is not None:
+        runner.info.artnet_enabled = bool(after.get("enable"))
+    log.info("built-in Art-Net on %s switched %s from the setup page", ip, "on" if enable else "off")
+    return web.json_response({"ok": True, "ip": ip, "artnet": after})
+
+
 def make_app(supervisor: Supervisor) -> web.Application:
     app = web.Application()
     app["supervisor"] = supervisor
@@ -474,6 +527,7 @@ def make_app(supervisor: Supervisor) -> web.Application:
     app.router.add_post("/api/setup/settings", api_setup_settings)
     app.router.add_post("/api/setup/yaml", api_setup_yaml)
     app.router.add_post("/api/setup/discover", api_setup_discover)
+    app.router.add_post("/api/setup/artnet", api_setup_artnet)
     return app
 
 

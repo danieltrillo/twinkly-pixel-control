@@ -322,6 +322,28 @@ class TwinklyClient:
         if result_code(reply) != CODE_OK:
             raise TwinklyError(f"set mode {mode!r} refused: {reply}")
 
+    async def artnet_config(self) -> dict:
+        """The built-in Art-Net mode's settings on Pro firmware: enable, model, port_address, dmx_address.
+
+        Consumer firmware has no such endpoint (NotFound)."""
+        reply = await self._request("GET", "/artnet/config")
+        return {k: v for k, v in reply.items() if k not in ("code", "result")}
+
+    async def set_artnet(self, enable: bool) -> dict:
+        """Switch the built-in Art-Net mode on or off, keeping its other settings; returns the new settings.
+
+        The bridge needs it off: a controller in Art-Net mode fights the realtime stream."""
+        current = await self.artnet_config()
+        body = {**current, "enable": bool(enable)}
+        reply = await self._request("POST", "/artnet/config", body)
+        if result_code(reply) != CODE_OK:
+            raise TwinklyError(f"artnet/config refused: {reply}")
+        after = await self.artnet_config()
+        if bool(after.get("enable")) != bool(enable):
+            state = "on" if after.get("enable") else "off"
+            raise TwinklyError(f"the controller accepted the change but still reports built-in Art-Net {state}")
+        return after
+
     async def led_config(self) -> list[dict]:
         try:
             reply = await self._request("GET", "/led/config")

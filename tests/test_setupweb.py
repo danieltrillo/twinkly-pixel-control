@@ -200,3 +200,50 @@ def test_bad_bodies(tmp_path, body):
             assert r.status == 400
 
     asyncio.run(main())
+
+
+def test_switch_built_in_artnet_off(tmp_path):
+    cfg_path = tmp_path / "bridge.yaml"
+    cfg_path.write_text(CONFIG)
+    sup, _ = _supervisor(cfg_path)
+
+    async def main():
+        pro = FakeTwinkly(pixels=600, api="v2", host="127.0.0.1", artnet=True)
+        consumer = FakeTwinkly(pixels=100, api="v1", host="127.0.0.1")
+        await pro.start()
+        await consumer.start()
+        try:
+            async with TestClient(TestServer(make_app(sup))) as client:
+                r = await client.post("/api/setup/discover", json={"ip": "127.0.0.1", "port": pro.http_port})
+                assert (await r.json())["devices"][0]["info"]["artnet_enabled"] is True
+
+                r = await client.post(
+                    "/api/setup/artnet", json={"ip": "127.0.0.1", "port": pro.http_port, "enable": False}
+                )
+                j = await r.json()
+                assert r.status == 200, j
+                assert j["artnet"] == {"enable": False, "model": 0, "port_address": 0, "dmx_address": 1}
+                assert pro.artnet is False and pro.logins == 1
+                r = await client.post("/api/setup/discover", json={"ip": "127.0.0.1", "port": pro.http_port})
+                assert (await r.json())["devices"][0]["info"]["artnet_enabled"] is False
+
+                r = await client.post(
+                    "/api/setup/artnet", json={"ip": "127.0.0.1", "port": pro.http_port, "enable": True}
+                )
+                assert r.status == 200 and pro.artnet is True
+
+                r = await client.post(
+                    "/api/setup/artnet", json={"ip": "127.0.0.1", "port": consumer.http_port, "enable": False}
+                )
+                assert r.status == 400 and "no built-in Art-Net" in (await r.json())["error"]
+                r = await client.post(
+                    "/api/setup/artnet", json={"ip": "127.0.0.1", "port": consumer.http_port, "enable": "off"}
+                )
+                assert r.status == 400
+                r = await client.post("/api/setup/artnet", json={"ip": "127.0.0.1", "port": 1, "enable": False})
+                assert r.status == 502
+        finally:
+            await pro.stop()
+            await consumer.stop()
+
+    asyncio.run(main())

@@ -106,7 +106,10 @@ controllers** broadcasts on every network the bridge box is on and lists what
 answers (name, model, LED count, firmware, whether it is still in a group or
 has built-in Art-Net on). Tick the ones you want and tap **Add selected**:
 universes are assigned one after another from the first free one. A
-controller that doesn't answer the broadcast can be looked up by IP.
+controller that doesn't answer the broadcast can be looked up by IP. A
+controller whose built-in Art-Net mode is still on (it fights the bridge) is
+flagged with a **Turn it off** button, one by one or all at once; that is
+saved on the controller itself, like switching it in the Twinkly Pro app.
 
 The same page edits everything else: each controller (universe, pixels,
 layout, fps, what to do when input stops, enabled), the console-side input,

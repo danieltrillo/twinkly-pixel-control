@@ -42,8 +42,11 @@ class FakeTwinkly:
         api: str = "v1",
         group_slave: bool = False,
         ports: int = 1,
+        artnet: bool = False,
     ) -> None:
         self.ports = max(1, ports)  # v2 gestalt lists the pixels split evenly over this many outputs
+        self.artnet = artnet  # v2: the built-in Art-Net mode (artnet_en in the gestalt, artnet/config)
+        self.artnet_config = {"model": 0, "port_address": 0, "dmx_address": 1}
         self.api = api  # "v1" (consumer) or "v2" (Pro firmware 4.x: /xled/v2, result codes nested)
         self.group_slave = group_slave
         self.pixels = pixels
@@ -165,7 +168,7 @@ class FakeTwinkly:
                 },
                 "group": group,
                 "frame_rate": 10,
-                "artnet_en": False,
+                "artnet_en": self.artnet,
                 "network": {"dhcp": True, "ip": self.host, "netmask": "255.255.255.0", "gateway": self.host},
                 "cloud": True,
                 "rest_locked": False,
@@ -187,6 +190,23 @@ class FakeTwinkly:
         self.modes.append(self.mode)
         if self.mode == "rt":
             self.last_udp = time.monotonic()
+        return self._ok({})
+
+    async def _get_artnet(self, request: web.Request) -> web.Response:
+        if not self._authed(request):
+            return self._denied()
+        return self._ok({"enable": self.artnet, **self.artnet_config})
+
+    async def _set_artnet(self, request: web.Request) -> web.Response:
+        if not self._authed(request):
+            return self._denied()
+        body = await request.json()
+        if not isinstance(body.get("enable"), bool):
+            return web.json_response({"result": {"code": 1104}}, status=400)
+        self.artnet = body["enable"]
+        for key in self.artnet_config:
+            if isinstance(body.get(key), int):
+                self.artnet_config[key] = body[key]
         return self._ok({})
 
     async def _led_config(self, request: web.Request) -> web.Response:
@@ -249,6 +269,8 @@ class FakeTwinkly:
             app.router.add_get("/xled/v2/fw/ct1/version", self._fw)
             app.router.add_get("/xled/v2/application/mode", self._get_mode)
             app.router.add_post("/xled/v2/application/mode", self._set_mode)
+            app.router.add_get("/xled/v2/artnet/config", self._get_artnet)
+            app.router.add_post("/xled/v2/artnet/config", self._set_artnet)
         app.router.add_route("*", "/{tail:.*}", self._not_found)
         self._runner = web.AppRunner(app, access_log=None)
         await self._runner.setup()
@@ -280,6 +302,7 @@ async def run_fake(args) -> None:
         api=args.api,
         group_slave=args.group_slave,
         ports=args.ports,
+        artnet=args.artnet,
     )
     await fake.start()
     print(
@@ -309,6 +332,7 @@ def add_fake_command(sub) -> None:
     p.add_argument("--api", choices=["v1", "v2"], default="v1", help="v2 = behave like Pro firmware 4.x")
     p.add_argument("--group-slave", action="store_true", help="v2 only: refuse output writes like a group slave")
     p.add_argument("--ports", type=int, default=1, help="v2 only: how many outputs the gestalt lists")
+    p.add_argument("--artnet", action="store_true", help="v2 only: start with the built-in Art-Net mode on")
 
     def _run(args) -> int:
         try:

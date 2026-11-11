@@ -260,8 +260,12 @@ function renderDevices() {
   const html = state.devices.map((entry) => {
     const spec = entry.spec, d = entry.derived;
     const name = spec.name || (d && d.name) || "?";
-    const st = running[name] || "";
+    const run = running[name] || {};
+    const st = run.state || "";
     const enabled = d ? d.enabled : spec.enabled !== false;
+    const artnet = run.artnet === true
+      ? `<div class="small warn">built-in Art-Net is on: it fights the bridge <button class="sm" data-artnet="${esc(spec.ip)}">Turn it off</button></div>`
+      : "";
     const line2 = d
       ? `${esc(d.protocol)} ${esc(d.universes)} · ${d.universe_count} univ · ${d.pixels} px · ${esc(d.input)}→${esc(d.order)} @ ${d.fps} fps`
       : `${esc(spec.universe ?? "?")} · ${esc(spec.pixels ?? "?")} px`;
@@ -269,6 +273,7 @@ function renderDevices() {
       <div class="body">
         <div><span class="dot ${stateCls(st)}"></span><b>${esc(name)}</b> <span class="muted small">${esc(spec.ip)}</span> <span class="small ${stateCls(st)}">${esc(st || (enabled ? "" : "disabled"))}</span></div>
         <div class="small muted">${line2}</div>
+        ${artnet}
       </div>
       <div class="btns">
         <button class="sm" data-edit="${esc(name)}">Edit</button>
@@ -288,6 +293,7 @@ function renderDevices() {
       applyResult(r, "devmsg");
     } catch (e) { say("devmsg", e.message, "bad"); }
   });
+  $("devices").querySelectorAll("[data-artnet]").forEach((b) => b.onclick = () => artnetOff([b.dataset.artnet], "devmsg"));
   $("devices").querySelectorAll("[data-del]").forEach((b) => b.onclick = async () => {
     if (!confirm(`Delete ${b.dataset.del} from the config?`)) return;
     try {
@@ -302,6 +308,24 @@ function applyResult(r, msgId) {
   renderAll(false);
   const extra = r.reload_error ? ` · bridge says: ${r.reload_error}` : "";
   say(msgId, `saved${r.backup ? ` (previous copy: ${r.backup})` : ""}${extra}`, r.reload_error ? "warn" : "ok");
+}
+
+// ---- the controller's built-in Art-Net mode (a persistent change on the controller) ----
+async function artnetOff(ips, msgId) {
+  if (!confirm(`Turn off built-in Art-Net on ${ips.length === 1 ? ips[0] : ips.length + " controllers"}? This is saved on the controller itself (the Twinkly Pro app shows it under DMX/Art-Net).`)) return;
+  let done = 0;
+  for (const ip of ips) {
+    try {
+      say(msgId, `switching ${ip}…`);
+      await api("POST", "api/setup/artnet", { ip, enable: false });
+      done++;
+      found.forEach((f) => { if (f.ip === ip && f.info) f.info.artnet_enabled = false; });
+      Object.values(state.running || {}).forEach((r) => { if (r.ip === ip) r.artnet = false; });
+    } catch (e) { say(msgId, `${ip}: ${e.message}`, "bad"); if (ips.length === 1) return; }
+  }
+  say(msgId, `built-in Art-Net off on ${done} of ${ips.length}`, done === ips.length ? "ok" : "warn");
+  renderFound();
+  pollStatus();
 }
 
 // ---- editor ----
@@ -353,7 +377,7 @@ function renderFound() {
     const notes = [];
     if (f.error) notes.push(`<span class="bad">${esc(f.error)}</span>`);
     if (info.group_mode === "slave") notes.push(`<span class="warn">in a group: the bridge can't drive it until you take it out of the group in the Twinkly Pro app</span>`);
-    if (info.artnet_enabled === true) notes.push(`<span class="warn">built-in Art-Net is on; turn it off in the app so it doesn't fight the bridge</span>`);
+    if (info.artnet_enabled === true) notes.push(`<span class="warn">built-in Art-Net is on; it fights the bridge</span> <button class="sm" data-artnet="${esc(f.ip)}">Turn it off</button>`);
     const right = f.configured_as
       ? `<span class="small muted">configured as<br><b>${esc(f.configured_as)}</b></span>`
       : `<label class="c"><input type="checkbox" data-pick="${i}" ${info.number_of_led ? "checked" : ""}> add</label>`;
@@ -366,10 +390,14 @@ function renderFound() {
       <div>${right}</div></div>`;
   }).join("");
   const addable = found.filter((f) => !f.configured_as && f.info && f.info.number_of_led).length;
-  $("found").innerHTML = html + (addable
-    ? `<div class="row" style="margin-top:8px"><button class="primary big" id="addpicked">Add selected (universes assigned in order)</button><button class="big" id="clearfound">Hide</button></div>`
-    : `<div class="row" style="margin-top:8px"><button class="big" id="clearfound">Hide</button></div>`);
+  const artnetOn = found.filter((f) => f.info && f.info.artnet_enabled === true).map((f) => f.ip);
+  $("found").innerHTML = html + `<div class="row" style="margin-top:8px">`
+    + (addable ? `<button class="primary big" id="addpicked">Add selected (universes assigned in order)</button>` : "")
+    + (artnetOn.length > 1 ? `<button class="big" id="artnetall">Turn off built-in Art-Net on all ${artnetOn.length}</button>` : "")
+    + `<button class="big" id="clearfound">Hide</button></div><div id="foundmsg" class="msg"></div>`;
   if ($("addpicked")) $("addpicked").onclick = addPicked;
+  if ($("artnetall")) $("artnetall").onclick = () => artnetOff(artnetOn, "foundmsg");
+  $("found").querySelectorAll("[data-artnet]").forEach((b) => b.onclick = () => artnetOff([b.dataset.artnet], "foundmsg"));
   $("clearfound").onclick = () => { found = []; renderFound(); $("findstate").textContent = ""; };
 }
 async function runDiscovery(body, label) {
@@ -482,7 +510,7 @@ async function pollStatus() {
   if (!state) return;
   try {
     const s = await api("GET", "api/status");
-    state.running = Object.fromEntries((s.devices || []).map((d) => [d.name, d.state]));
+    state.running = Object.fromEntries((s.devices || []).map((d) => [d.name, { state: d.state, ip: d.ip, artnet: d.info ? d.info.artnet_enabled : null }]));
     if ($("editor").hidden) renderDevices();
   } catch (e) {}
 }
