@@ -148,3 +148,78 @@ def test_reassert_endpoint_503_when_not_running(tmp_path):
             assert r.status == 503
 
     asyncio.run(main())
+
+
+def test_reassert_seizes_a_controller_it_never_fed(spin):
+    async def scenario():
+        fake = FakeTwinkly(pixels=128, api="v2", host="127.0.0.2", rt_timeout=1000.0)
+        await fake.start()
+        eng = Engine(_cfg([_spec("A", "127.0.0.2", 0, fake)]), sender=UdpSender(), hostname="box")
+        await eng.start(open_sockets=False)
+        dev = eng.devices[0]
+        try:
+            assert await wait_for(lambda: dev.ready)
+            # Never fed: the bridge isn't holding it, it's sitting on its own content.
+            assert fake.mode == "movie" and not dev.rt_armed
+            assert eng.reassert() == 1
+            assert await wait_for(lambda: fake.mode == "rt")
+            assert dev.rt_armed and fake.logins == 1
+        finally:
+            await eng.stop()
+            await fake.stop()
+
+    asyncio.run(scenario())
+
+
+def test_reassert_rekicks_even_when_the_device_reports_rt(spin):
+    async def scenario():
+        fake = FakeTwinkly(pixels=128, api="v2", host="127.0.0.2", rt_timeout=1000.0)
+        await fake.start()
+        eng = Engine(_cfg([_spec("A", "127.0.0.2", 0, fake)]), sender=UdpSender(), hostname="box")
+        await eng.start(open_sockets=False)
+        try:
+            assert await wait_for(lambda: eng.devices[0].ready)
+            eng.feed("artnet", 0, bytes((10, 20, 30, 40)) * 128, "2.0.0.1")
+            assert await wait_for(lambda: fake.mode == "rt")
+            # The device still answers "rt" but (in the field) shows its own
+            # content. The button must re-issue rt anyway, not no-op as before.
+            sets = len(fake.modes)
+            assert eng.reassert() == 1
+            assert await wait_for(lambda: len(fake.modes) > sets)
+            assert fake.modes[-1] == "rt"
+        finally:
+            await eng.stop()
+            await fake.stop()
+
+    asyncio.run(scenario())
+
+
+def test_reassert_pins_through_input_loss(spin):
+    async def scenario():
+        fake = FakeTwinkly(pixels=128, api="v2", host="127.0.0.2", rt_timeout=1000.0)
+        await fake.start()
+        # on_loss=release: normally the bridge hands the device back when input stops.
+        spec = _spec("A", "127.0.0.2", 0, fake)
+        spec["on_loss"] = "release"
+        spec["loss_timeout"] = 0.5
+        eng = Engine(_cfg([spec]), sender=UdpSender(), hostname="box")
+        await eng.start(open_sockets=False)
+        dev = eng.devices[0]
+        try:
+            assert await wait_for(lambda: dev.ready)
+            eng.feed("artnet", 0, bytes((10, 20, 30, 40)) * 128, "2.0.0.1")
+            assert await wait_for(lambda: fake.mode == "rt")
+            # Pin it, then stop feeding well past loss_timeout.
+            assert eng.reassert() == 1
+            assert await wait_for(lambda: dev._pinned)
+            await asyncio.sleep(0.9)  # well past loss_timeout
+            # Pinned: it does NOT release, and keepalives keep it lit.
+            assert dev.rt_armed and fake.mode == "rt"
+            frames = fake.frames
+            await asyncio.sleep(0.3)
+            assert fake.frames > frames
+        finally:
+            await eng.stop()
+            await fake.stop()
+
+    asyncio.run(scenario())

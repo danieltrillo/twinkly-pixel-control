@@ -178,6 +178,7 @@ class DeviceRunner:
         self._login_at = 0.0
         self._mode_checked = 0.0
         self._reassert = False
+        self._pinned = False
         self._tasks: list[asyncio.Task] = []
 
     @property
@@ -204,7 +205,7 @@ class DeviceRunner:
         return self.ever_had_data and now - self.last_rx < self.cfg.loss_timeout
 
     def wants_rt(self, now: float) -> bool:
-        if self.scanning(now) or self.has_data(now):
+        if self._pinned or self.scanning(now) or self.has_data(now):
             return True
         return self.ever_had_data and self.cfg.on_loss in ("hold", "black")
 
@@ -292,7 +293,7 @@ class DeviceRunner:
         if self.has_data(now):
             if self.dirty or now - self.last_send >= KEEPALIVE:
                 self.send_frame(now)
-        elif self.cfg.on_loss == "hold":
+        elif self.cfg.on_loss == "hold" or self._pinned:
             if now - self.last_send >= KEEPALIVE:
                 self.send_frame(now)
         elif self.cfg.on_loss == "black":
@@ -302,9 +303,13 @@ class DeviceRunner:
     # -- control -------------------------------------------------------------
 
     def reassert(self) -> None:
-        """Re-check rt mode on the next control tick instead of waiting for the
-        next MODE_CHECK poll. Backs the "reassert realtime" button, for when a
-        controller has dropped back to its own stored content mid-show."""
+        """Seize realtime now, on the next control tick. Backs the "reassert
+        realtime" button, for when a controller has dropped back to its own
+        stored content mid-show. Unlike the periodic check, this trusts nothing
+        the controller reports: it re-issues rt and pushes a frame even if the
+        device still claims it is live (some sit on their own content while
+        answering "rt"), arms a controller that was never streaming, and pins it
+        so input loss can't hand it back."""
         self._reassert = True
 
     async def connect(self) -> None:
@@ -353,7 +358,23 @@ class DeviceRunner:
         want = self.wants_rt(now)
         forced = self._reassert  # a "reassert realtime" button press
         self._reassert = False
-        if want and not self.rt_armed:
+        if forced:
+            # The operator pressed "reassert": seize control now and hold it.
+            # Trust nothing the controller reports — some units sit on their own
+            # stored content while still answering "rt" — so arm if needed,
+            # re-issue rt and push a frame unconditionally, and pin so input loss
+            # can't hand it back until the bridge restarts.
+            if not self.rt_armed:
+                mode = await self.client.get_mode()
+                if mode and mode != "rt":
+                    self.previous_mode = mode
+            await self.client.set_mode("rt")
+            self.rt_armed = True
+            self._pinned = True
+            self._mode_checked = now
+            self.send_frame(now)
+            log.info("%s: realtime reasserted (forced)", self.name)
+        elif want and not self.rt_armed:
             mode = await self.client.get_mode()
             if mode and mode != "rt":
                 self.previous_mode = mode
@@ -367,24 +388,21 @@ class DeviceRunner:
             await self.client.set_mode(back)
             self.rt_armed = False
             log.info("%s: no data for %.0fs, handed back to '%s' mode", self.name, self.cfg.loss_timeout, back)
-        elif self.rt_armed and (forced or now - self._mode_checked >= MODE_CHECK):
+        elif self.rt_armed and now - self._mode_checked >= MODE_CHECK:
             self._mode_checked = now
             mode = await self.client.get_mode()
             if mode != "rt":
-                log.warning(
-                    "%s: device left rt mode (now '%s'), %s",
-                    self.name,
-                    mode,
-                    "reasserting" if forced else "switching back",
-                )
+                log.warning("%s: device left rt mode (now '%s'), switching back", self.name, mode)
                 await self.client.set_mode("rt")
                 self.send_frame(now)  # light it again immediately, don't wait for the next keepalive
-            elif forced:
-                log.info("%s: realtime reasserted, already live", self.name)
         if self.scanning(now) and self.rt_armed:
             self.state = f"mapping scan (pass {self.scan.status(now)['pass']}/{self.scan.repeat})"
         elif self.rt_armed:
-            self.state = "streaming" if self.has_data(now) else f"no input ({self.cfg.on_loss})"
+            self.state = (
+                "streaming"
+                if self.has_data(now)
+                else ("holding (reasserted)" if self._pinned else f"no input ({self.cfg.on_loss})")
+            )
         else:
             self.state = "released" if self.ever_had_data else "ready, waiting for input"
 
@@ -476,6 +494,7 @@ class DeviceRunner:
             "on_loss": self.cfg.on_loss,
             "udp_protocol": self.protocol if self.info else None,
             "previous_mode": self.previous_mode,
+            "pinned": self._pinned,
             "info": self.info.to_dict() if self.info else None,
             "rx": self.rx.to_dict(now),
             "tx": self.tx.to_dict(now),
