@@ -623,8 +623,11 @@ def run_scan(dev, fps, order, proto_override, slot, brightness, color, repeat, c
 
 
 # ------------------------------------------------------------------- artnet --
-def run_artnet(dev, switch):
-    """Show the built-in Art-Net setting; with --off/--on try the POST bodies the firmware may take."""
+def run_artnet(dev, switch, explore=False):
+    """Show the built-in Art-Net setting; with --off/--on try the requests the firmware may take.
+
+    Every request only ever carries the current settings with "enable" changed, so a
+    rejected one changes nothing. --explore also probes nearby routes and methods."""
     g = dev.detect()
     dev.login()
     print(f"  {g.get('device_name', '?')} ({dev.api}), gestalt artnet_en = {g.get('artnet_en')!r}")
@@ -638,33 +641,61 @@ def run_artnet(dev, switch):
     want = switch == "on"
     settings = {k: v for k, v in cur.items() if k not in ("code", "result")}
     attempts = [
-        {"enable": want},
-        {"enable": int(want)},
-        {**settings, "enable": want},
-        {**settings, "enable": int(want)},
-        {"enabled": want},
-        {"artnet_en": want},
+        ("POST", "/artnet/config", {"enable": want}),
+        ("POST", "/artnet/config", {"enable": int(want)}),
+        ("POST", "/artnet/config", {**settings, "enable": want}),
+        ("POST", "/artnet/config", {**settings, "enable": int(want)}),
     ]
-    seen = []
-    for body in attempts:
-        if body in seen:
+    if explore:
+        word = "on" if want else "off"
+        attempts += [
+            ("POST", "/artnet/config", {"enable": word}),
+            ("POST", "/artnet/config", {"enable": str(want).lower()}),
+            ("POST", "/artnet/config", {"mode": word}),
+            ("POST", "/artnet/config", {"artnet": {**settings, "enable": want}}),
+            ("POST", "/artnet/config", {"config": {**settings, "enable": want}}),
+            ("POST", "/artnet/config", {"enable": want, "model": str(settings.get("model", 0))}),
+            ("PUT", "/artnet/config", {"enable": want}),
+            ("PUT", "/artnet/config", {**settings, "enable": want}),
+            ("PATCH", "/artnet/config", {"enable": want}),
+            ("POST", "/artnet/enable", {"enable": want}),
+            ("POST", "/artnet/enable", {"value": want}),
+            ("POST", "/artnet", {"enable": want}),
+            ("POST", "/artnet", {**settings, "enable": want}),
+            ("POST", "/artnet/config/enable", {"enable": want}),
+            ("POST", "/artnet/mode", {"mode": word}),
+            ("POST", "/artnet/mode", {"enable": want}),
+            ("POST", "/dmx/config", {**settings, "enable": want}),
+            ("POST", "/dmx/config", {"enable": want}),
+            ("POST", "/dmx", {"enable": want}),
+            ("POST", "/device/config", {"artnet_en": want}),
+            ("POST", "/artnet/en", {"enable": want}),
+            ("POST", "/artnet/enabled", {"enabled": want}),
+        ]
+    seen = set()
+    for method, path, body in attempts:
+        key = (method, path, json.dumps(body, sort_keys=True))
+        if key in seen:
             continue
-        seen.append(body)
+        seen.add(key)
+        label = f"{method} {path.lstrip('/')} {json.dumps(body)}"
         try:
-            reply = dev.post("/artnet/config", body)
-        except RuntimeError as e:
-            print(f"  POST {json.dumps(body)} -> {e}")
+            reply = dev._req(method, path, body)
+        except NotFound:
+            print(f"  {label} -> 404 (no such route)")
             continue
-        print(f"  POST {json.dumps(body)} -> {json.dumps(reply)}")
-        if code(reply) == 1000:
-            after = dev.get("/artnet/config")
-            g2 = dev.detect() if dev.gestalt is None else dev.get("/gestalt", auth=False)
-            print(f"  GET artnet/config -> {json.dumps(after)}; gestalt artnet_en = {g2.get('artnet_en')!r}")
-            if bool(after.get("enable")) == want:
-                print(f"  OK: built-in Art-Net is now {'on' if want else 'off'} (body that worked: {json.dumps(body)})")
-                return
-            print("  accepted, but the setting did not change; trying the next body")
-    sys.exit("  no body was accepted; see the replies above")
+        except RuntimeError as e:
+            print(f"  {label} -> {str(e).split('->', 1)[-1].strip()}")
+            continue
+        print(f"  {label} -> {json.dumps(reply)}")
+        after = dev.get("/artnet/config")
+        g2 = dev.get("/gestalt", auth=False)
+        print(f"     now: artnet/config {json.dumps(after)}; gestalt artnet_en = {g2.get('artnet_en')!r}")
+        if bool(after.get("enable")) == want and bool(g2.get("artnet_en")) == want:
+            print(f"  OK: built-in Art-Net is now {'on' if want else 'off'} (request that worked: {label})")
+            return
+        print("     accepted, but the setting did not change; trying the next one")
+    sys.exit("  nothing worked; see the replies above")
 
 
 # --------------------------------------------------------------------- main --
@@ -704,6 +735,7 @@ def main():
     ap.add_argument("--countdown", type=int, default=5, help="scan: black seconds before the first pass (default 5)")
     ap.add_argument("--off", action="store_true", help="artnet: switch the built-in Art-Net mode off")
     ap.add_argument("--on", action="store_true", help="artnet: switch it on")
+    ap.add_argument("--explore", action="store_true", help="artnet: also try nearby routes, methods and body shapes")
     a = ap.parse_args()
 
     dev = Twinkly(a.ip, a.http_port, a.udp_port)
@@ -717,7 +749,7 @@ def main():
         elif a.command == "chunks":
             run_chunks(dev, a.fps, a.order, a.proto, a.hold)
         elif a.command == "artnet":
-            run_artnet(dev, "off" if a.off else "on" if a.on else None)
+            run_artnet(dev, "off" if a.off else "on" if a.on else None, a.explore)
         else:
             run_test(dev, a.fps, a.order, a.proto, a.yes, a.hold)
     except RuntimeError as e:
