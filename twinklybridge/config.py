@@ -70,6 +70,10 @@ class DeviceConfig:
     fps: float = 25.0
     on_loss: str = "hold"
     loss_timeout: float = 5.0
+    # Assemble a whole input frame before sending it, so no single output trails
+    # a frame behind the rest (fixes per-output frame tearing). Off = write each
+    # universe to the output the instant it lands.
+    coalesce: bool = True
     enabled: bool = True
     http_port: int = HTTP_PORT
     rt_port: int = RT_PORT
@@ -364,6 +368,7 @@ DEVICE_KEYS = {
     "fps",
     "on_loss",
     "loss_timeout",
+    "coalesce",
     "enabled",
     "http_port",
     "rt_port",
@@ -418,6 +423,7 @@ def _parse_device(index: int, raw: Any, defaults: dict, inp: InputConfig) -> Dev
         fps=_float(merged.get("fps"), where("fps"), 25.0, 1, 60),
         on_loss=_choice(merged.get("on_loss"), where("on_loss"), ON_LOSS, "hold"),
         loss_timeout=_float(merged.get("loss_timeout"), where("loss_timeout"), 5.0, 0.5, 3600),
+        coalesce=_bool(merged.get("coalesce"), where("coalesce"), True),
         enabled=_bool(spec.get("enabled"), f"{path}.enabled", True),
         http_port=_int(merged.get("http_port"), where("http_port"), HTTP_PORT, 1, 65535),
         rt_port=_int(merged.get("rt_port"), where("rt_port"), RT_PORT, 1, 65535),

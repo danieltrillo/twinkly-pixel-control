@@ -31,6 +31,11 @@ RELOGIN_AFTER = 3 * 3600.0  # tokens last about 4 hours
 CONTROL_TICK = 0.25
 ACTIVE_WINDOW = 3.0
 BACKOFF = (1, 2, 4, 8, 15)
+# The console sends no ArtSync, so the bridge waits for all of a device's
+# universes before it promotes a frame to the output. If a universe is dropped,
+# flush the partial frame this long after it started, so a lost packet costs a
+# frame or two, not a stall.
+FRAME_LATCH_TIMEOUT = 0.1
 
 Sender = Callable[[bytes, tuple[str, int]], bool]
 
@@ -173,6 +178,12 @@ class DeviceRunner:
 
     def __post_init__(self) -> None:
         self.buffer = bytearray(self.cfg.pixels * self.cfg.channels)
+        # Frame coalescing: stage incoming universes here and promote a whole
+        # frame to self.buffer at once (see write/_latch), so no output trails.
+        self._pending = bytearray(self.cfg.pixels * self.cfg.channels)
+        self._seen: set[int] = set()
+        self._frame_started = 0.0
+        self._nsegments = len(self.cfg.segments)
         self.client: TwinklyClient | None = None
         self._ready = False
         self._login_at = 0.0
@@ -195,11 +206,33 @@ class DeviceRunner:
         ch = self.cfg.channels
         chunk = data[segment.channel : segment.channel + segment.count * ch]
         start = segment.first_pixel * ch
-        self.buffer[start : start + len(chunk)] = chunk
-        self.dirty = True
         self.last_rx = now
         self.ever_had_data = True
         self.rx.hit(now)
+        if not self.cfg.coalesce:
+            self.buffer[start : start + len(chunk)] = chunk  # write each universe as it lands (can tear)
+            self.dirty = True
+            return
+        # Coalesce whole frames. The console sends no ArtSync, so the bridge
+        # finds the frame boundary itself: stage each universe and promote the
+        # frame to the live buffer only once every one of this device's
+        # universes has landed. That latch fires on the *last* universe, so the
+        # output it feeds can't lag a frame behind the rest. A short staleness
+        # flush caps the cost of a dropped universe at a frame or two.
+        if self._seen and now - self._frame_started >= FRAME_LATCH_TIMEOUT:
+            self._latch()
+        if not self._seen:
+            self._frame_started = now
+        self._pending[start : start + len(chunk)] = chunk
+        self._seen.add(start)
+        if len(self._seen) >= self._nsegments:
+            self._latch()
+
+    def _latch(self) -> None:
+        """Promote the staged frame to the live buffer in one shot — no tearing."""
+        self.buffer[:] = self._pending
+        self.dirty = True
+        self._seen.clear()
 
     def has_data(self, now: float) -> bool:
         return self.ever_had_data and now - self.last_rx < self.cfg.loss_timeout

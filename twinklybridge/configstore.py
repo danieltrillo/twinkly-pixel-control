@@ -46,6 +46,7 @@ DEVICE_ORDER = (
     "fps",
     "on_loss",
     "loss_timeout",
+    "coalesce",
     "enabled",
     "http_port",
     "rt_port",
@@ -83,7 +84,7 @@ _INT_KEYS = {
     "decode_width",
 }
 _FLOAT_KEYS = {"fps", "loss_timeout", "slot"}
-_BOOL_KEYS = {"enabled", "artnet", "sacn", "keep_clips"}
+_BOOL_KEYS = {"enabled", "artnet", "sacn", "keep_clips", "coalesce"}
 _LAYOUT_KEYS = {"input", "order"}
 _TRUE = ("true", "yes", "on", "1")
 _FALSE = ("false", "no", "off", "0")
