@@ -40,6 +40,13 @@ FRAME_LATCH_TIMEOUT = 0.1
 Sender = Callable[[bytes, tuple[str, int]], bool]
 
 
+def _running_loop() -> asyncio.AbstractEventLoop | None:
+    try:
+        return asyncio.get_running_loop()
+    except RuntimeError:
+        return None  # called outside the event loop (tests, tools): send at once
+
+
 class RateCounter:
     __slots__ = ("total", "rate", "last", "_window", "_window_start")
 
@@ -191,6 +198,7 @@ class DeviceRunner:
         self._reassert = False
         self._pinned = False
         self._tasks: list[asyncio.Task] = []
+        self._paced: list[asyncio.TimerHandle] = []  # this frame's packets still waiting for their slot
 
     @property
     def name(self) -> str:
@@ -301,16 +309,46 @@ class DeviceRunner:
             return
         if frame is None:
             frame = self.render(black)
+        packets = build_packets(self.protocol, self.client.token, frame, self.out_pixels)
+        addr = (self.cfg.ip, self.cfg.rt_port)
+        self._cancel_paced()  # a newer frame replaces whatever is left of the last one
+        gap = self._packet_gap(len(packets))
+        loop = _running_loop() if gap > 0 else None
         ok = True
-        for packet in build_packets(self.protocol, self.client.token, frame, self.out_pixels):
-            if not self.sender(packet, (self.cfg.ip, self.cfg.rt_port)):
-                ok = False
+        if loop is None:
+            for packet in packets:
+                if not self.sender(packet, addr):
+                    ok = False
+        else:
+            # Spread the frame's packets out instead of firing them back-to-back:
+            # the controller can lose the tail of a burst (the end of the frame).
+            ok = self.sender(packets[0], addr)
+            self._paced = [
+                loop.call_later(gap * i, self._send_paced, packet, addr) for i, packet in enumerate(packets[1:], 1)
+            ]
         if ok:
             self.tx.hit(now)
         else:
             self.send_errors += 1
         self.last_send = now
         self.dirty = False
+
+    def _packet_gap(self, packets: int) -> float:
+        """Seconds between one frame's packets: the configured gap, capped so the
+        whole frame goes out within half a frame period (the next frame cancels
+        anything still queued, so a longer spread would starve the last packet)."""
+        if packets < 2 or self.cfg.packet_gap_ms <= 0:
+            return 0.0
+        return min(self.cfg.packet_gap_ms / 1000.0, 0.5 / self.cfg.fps / (packets - 1))
+
+    def _send_paced(self, packet: bytes, addr: tuple[str, int]) -> None:
+        if not self.sender(packet, addr):
+            self.send_errors += 1
+
+    def _cancel_paced(self) -> None:
+        for handle in self._paced:
+            handle.cancel()
+        self._paced = []
 
     def frame_step(self, now: float) -> None:
         """Called at cfg.fps. Sends a frame when there is something to send."""
@@ -501,6 +539,7 @@ class DeviceRunner:
         if self._tasks:
             await asyncio.gather(*self._tasks, return_exceptions=True)
         self._tasks = []
+        self._cancel_paced()
         if release and self.rt_armed and self.client is not None:
             try:
                 await asyncio.wait_for(self.client.set_mode(self.previous_mode or "movie"), 2.0)
@@ -524,6 +563,7 @@ class DeviceRunner:
             "input": self.cfg.input,
             "order": self.order or self.cfg.order,
             "fps": self.cfg.fps,
+            "packet_gap_ms": self.cfg.packet_gap_ms,
             "on_loss": self.cfg.on_loss,
             "udp_protocol": self.protocol if self.info else None,
             "previous_mode": self.previous_mode,

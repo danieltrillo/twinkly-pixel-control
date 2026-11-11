@@ -23,6 +23,7 @@ defaults:
   input: RGBW               # how the console patches one pixel: RGBW, RGB, GRBW, ...
   order: auto               # bytes on the wire to the Twinkly; auto = WRGB for RGBW strands, RGB for RGB
   fps: 25                   # frames per second sent to each controller (Twinkly runs about 24)
+  packet_gap_ms: 1          # ms between a frame's UDP packets; back-to-back, a controller can lose the frame's end
   on_loss: hold             # input stops: hold (last look) | black | release (back to the app's effect)
   loss_timeout: 5           # seconds without input before on_loss kicks in
 

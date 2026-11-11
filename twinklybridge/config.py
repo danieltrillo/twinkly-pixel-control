@@ -68,6 +68,10 @@ class DeviceConfig:
     pixels_per_universe: int = 0  # 0 = as many as fit (128 for RGBW, 170 for RGB)
     order: str = "auto"  # byte order on the wire to the Twinkly; auto = from the device
     fps: float = 25.0
+    # Milliseconds between the UDP packets of one realtime frame (a 1440-pixel
+    # RGBW frame is 7 packets). Fired back-to-back, the controller can lose the
+    # tail of the burst, which leaves the end of the frame frozen. 0 = no gap.
+    packet_gap_ms: float = 1.0
     on_loss: str = "hold"
     loss_timeout: float = 5.0
     # Assemble a whole input frame before sending it, so no single output trails
@@ -366,6 +370,7 @@ DEVICE_KEYS = {
     "pixels_per_universe",
     "order",
     "fps",
+    "packet_gap_ms",
     "on_loss",
     "loss_timeout",
     "coalesce",
@@ -421,6 +426,7 @@ def _parse_device(index: int, raw: Any, defaults: dict, inp: InputConfig) -> Dev
         pixels_per_universe=ppu,
         order=order,
         fps=_float(merged.get("fps"), where("fps"), 25.0, 1, 60),
+        packet_gap_ms=_float(merged.get("packet_gap_ms"), where("packet_gap_ms"), 1.0, 0, 10),
         on_loss=_choice(merged.get("on_loss"), where("on_loss"), ON_LOSS, "hold"),
         loss_timeout=_float(merged.get("loss_timeout"), where("loss_timeout"), 5.0, 0.5, 3600),
         coalesce=_bool(merged.get("coalesce"), where("coalesce"), True),

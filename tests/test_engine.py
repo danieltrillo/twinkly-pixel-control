@@ -420,3 +420,81 @@ def test_mapping_scan_replaces_the_input_then_hands_back():
     assert not dev.scanning(now[0]) and dev.wants_rt(now[0])
     dev.frame_step(now[0])
     assert dev.scan is None and pixels()[:4] == bytes([6, 9, 8, 7])  # WRGB of the console's RGBW
+
+
+# -- frame pacing ----------------------------------------------------------------
+
+
+def _rt_device(gap_ms, fps=25.0, pixels=1440):
+    """A device that looks connected to a 1440-pixel RGBW controller (7 rt packets a frame)."""
+    from types import SimpleNamespace
+
+    from twinklybridge.twinkly import DeviceInfo
+
+    spec = {"name": "T", "ip": "10.0.0.1", "universe": "0.0.0", "pixels": pixels, "fps": fps, "packet_gap_ms": gap_ms}
+    sent = []
+    eng = Engine(make_config([spec]), sender=lambda p, a: sent.append((time.monotonic(), p)) or True, hostname="box")
+    dev = eng.devices[0]
+    dev.order, dev.info, dev._ready = "WRGB", DeviceInfo(led_profile="RGBW", number_of_led=pixels), True
+    dev.client = SimpleNamespace(token=b"\x01" * 8)
+    return dev, sent
+
+
+def test_frame_packets_are_spaced_out():
+    async def scenario():
+        dev, sent = _rt_device(1.0)
+        start = time.monotonic()
+        dev.send_frame(start)
+        assert [p[11] for _, p in sent] == [0]  # only the first packet leaves at once
+        assert await wait_for(lambda: len(sent) == 7, timeout=1.0)
+        assert [p[11] for _, p in sent] == list(range(7))  # every fragment, in order
+        for i, (at, _) in enumerate(sent):
+            assert at - start >= i * 0.001 - 1e-4  # packet i waits i gaps
+        assert sum(len(p) - 12 for _, p in sent) == 1440 * 4
+        assert dev.tx.total == 1 and dev.send_errors == 0
+
+    asyncio.run(scenario())
+
+
+def test_zero_gap_sends_the_whole_frame_at_once():
+    async def scenario():
+        dev, sent = _rt_device(0)
+        dev.send_frame(time.monotonic())
+        assert [p[11] for _, p in sent] == list(range(7))
+
+    asyncio.run(scenario())
+
+
+def test_without_an_event_loop_the_frame_goes_out_at_once():
+    dev, sent = _rt_device(1.0)
+    dev.send_frame(100.0)
+    assert [p[11] for _, p in sent] == list(range(7))
+
+
+def test_a_newer_frame_replaces_the_rest_of_the_last_one():
+    async def scenario():
+        dev, sent = _rt_device(1.0)
+        dev.send_frame(time.monotonic(), frame=bytes([1]) * 5760)
+        dev.send_frame(time.monotonic(), frame=bytes([2]) * 5760)
+        await asyncio.sleep(0.05)
+        assert [(p[11], p[12]) for _, p in sent] == [(0, 1)] + [(i, 2) for i in range(7)]
+
+    asyncio.run(scenario())
+
+
+def test_stop_drops_packets_still_waiting():
+    async def scenario():
+        dev, sent = _rt_device(5.0)
+        dev.send_frame(time.monotonic())
+        await dev.stop(release=False)
+        await asyncio.sleep(0.05)
+        assert len(sent) == 1
+
+    asyncio.run(scenario())
+
+
+def test_packet_gap_is_capped_to_fit_half_a_frame():
+    dev, _ = _rt_device(10.0, fps=60)
+    assert dev._packet_gap(7) == pytest.approx(0.5 / 60 / 6)
+    dev, _ = _rt_device(1.0, fps=25)
+    assert dev._packet_gap(7) == pytest.approx(0.001) and dev._packet_gap(1) == 0.0
