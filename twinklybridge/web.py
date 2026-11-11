@@ -60,6 +60,22 @@ async def api_reload(request: web.Request) -> web.Response:
     return web.json_response({"ok": not sup.config_error, "error": sup.config_error})
 
 
+async def api_reassert(request: web.Request) -> web.Response:
+    """Force controllers back into realtime now, for when one has dropped to its own stored content."""
+    sup: Supervisor = request.app["supervisor"]
+    if sup.engine is None or not sup.engine.running:
+        return _fail("the bridge is not running", 503)
+    body = await _json_body(request)
+    if body is None:
+        return _fail("expected JSON")
+    name = str(body.get("name") or "").strip() or None
+    if name is not None and not any(d.name == name for d in sup.engine.devices):
+        return _fail(f"no running device named {name!r}", 404)
+    count = sup.engine.reassert(name)
+    log.info("realtime reasserted from the web page (%s)", name or f"all {count} controller(s)")
+    return web.json_response({"ok": True, "count": count})
+
+
 # --------------------------------------------------------------------------
 # Camera mapping
 # --------------------------------------------------------------------------
@@ -511,6 +527,7 @@ def make_app(supervisor: Supervisor) -> web.Application:
     app.router.add_get("/api/log", api_log)
     app.router.add_get("/api/config", api_config)
     app.router.add_post("/api/reload", api_reload)
+    app.router.add_post("/api/reassert", api_reassert)
     app.router.add_get("/api/map/state", api_map_state)
     app.router.add_post("/api/map/scan", api_map_scan)
     app.router.add_post("/api/map/scan/stop", api_map_scan_stop)

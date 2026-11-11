@@ -176,6 +176,7 @@ class DeviceRunner:
         self._ready = False
         self._login_at = 0.0
         self._mode_checked = 0.0
+        self._reassert = False
         self._tasks: list[asyncio.Task] = []
 
     @property
@@ -299,6 +300,12 @@ class DeviceRunner:
 
     # -- control -------------------------------------------------------------
 
+    def reassert(self) -> None:
+        """Re-check rt mode on the next control tick instead of waiting for the
+        next MODE_CHECK poll. Backs the "reassert realtime" button, for when a
+        controller has dropped back to its own stored content mid-show."""
+        self._reassert = True
+
     async def connect(self) -> None:
         self.state = "connecting"
         client = TwinklyClient(self.session, self.cfg.ip, port=self.cfg.http_port)
@@ -343,6 +350,8 @@ class DeviceRunner:
             await self.client.login()
             self._login_at = now
         want = self.wants_rt(now)
+        forced = self._reassert  # a "reassert realtime" button press
+        self._reassert = False
         if want and not self.rt_armed:
             mode = await self.client.get_mode()
             if mode and mode != "rt":
@@ -357,12 +366,20 @@ class DeviceRunner:
             await self.client.set_mode(back)
             self.rt_armed = False
             log.info("%s: no data for %.0fs, handed back to '%s' mode", self.name, self.cfg.loss_timeout, back)
-        elif self.rt_armed and now - self._mode_checked >= MODE_CHECK:
+        elif self.rt_armed and (forced or now - self._mode_checked >= MODE_CHECK):
             self._mode_checked = now
             mode = await self.client.get_mode()
             if mode != "rt":
-                log.warning("%s: device left rt mode (now '%s'), switching back", self.name, mode)
+                log.warning(
+                    "%s: device left rt mode (now '%s'), %s",
+                    self.name,
+                    mode,
+                    "reasserting" if forced else "switching back",
+                )
                 await self.client.set_mode("rt")
+                self.send_frame(now)  # light it again immediately, don't wait for the next keepalive
+            elif forced:
+                log.info("%s: realtime reasserted, already live", self.name)
         if self.scanning(now) and self.rt_armed:
             self.state = f"mapping scan (pass {self.scan.status(now)['pass']}/{self.scan.repeat})"
         elif self.rt_armed:
@@ -680,6 +697,19 @@ class Engine:
             len(to_stop),
             len(kept),
         )
+
+    def reassert(self, name: str | None = None) -> int:
+        """Poke controllers to re-check rt mode now rather than at the next poll.
+
+        With a name, only that controller; otherwise every one. Returns how many
+        were poked (0 means no such device).
+        """
+        poked = 0
+        for dev in self.devices:
+            if name is None or dev.name == name:
+                dev.reassert()
+                poked += 1
+        return poked
 
     def _join_sacn_groups(self, sock: socket.socket) -> None:
         local = self.config.input.ip if self.config.input.ip != "0.0.0.0" else "0.0.0.0"
