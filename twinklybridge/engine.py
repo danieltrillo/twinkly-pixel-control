@@ -31,8 +31,20 @@ RELOGIN_AFTER = 3 * 3600.0  # tokens last about 4 hours
 CONTROL_TICK = 0.25
 ACTIVE_WINDOW = 3.0
 BACKOFF = (1, 2, 4, 8, 15)
+# The console sends no ArtSync, so the bridge waits for all of a device's
+# universes before it promotes a frame to the output. If a universe is dropped,
+# flush the partial frame this long after it started, so a lost packet costs a
+# frame or two, not a stall.
+FRAME_LATCH_TIMEOUT = 0.1
 
 Sender = Callable[[bytes, tuple[str, int]], bool]
+
+
+def _running_loop() -> asyncio.AbstractEventLoop | None:
+    try:
+        return asyncio.get_running_loop()
+    except RuntimeError:
+        return None  # called outside the event loop (tests, tools): send at once
 
 
 class RateCounter:
@@ -173,12 +185,20 @@ class DeviceRunner:
 
     def __post_init__(self) -> None:
         self.buffer = bytearray(self.cfg.pixels * self.cfg.channels)
+        # Frame coalescing: stage incoming universes here and promote a whole
+        # frame to self.buffer at once (see write/_latch), so no output trails.
+        self._pending = bytearray(self.cfg.pixels * self.cfg.channels)
+        self._seen: set[int] = set()
+        self._frame_started = 0.0
+        self._nsegments = len(self.cfg.segments)
         self.client: TwinklyClient | None = None
         self._ready = False
         self._login_at = 0.0
         self._mode_checked = 0.0
         self._reassert = False
+        self._pinned = False
         self._tasks: list[asyncio.Task] = []
+        self._paced: list[asyncio.TimerHandle] = []  # this frame's packets still waiting for their slot
 
     @property
     def name(self) -> str:
@@ -194,17 +214,39 @@ class DeviceRunner:
         ch = self.cfg.channels
         chunk = data[segment.channel : segment.channel + segment.count * ch]
         start = segment.first_pixel * ch
-        self.buffer[start : start + len(chunk)] = chunk
-        self.dirty = True
         self.last_rx = now
         self.ever_had_data = True
         self.rx.hit(now)
+        if not self.cfg.coalesce:
+            self.buffer[start : start + len(chunk)] = chunk  # write each universe as it lands (can tear)
+            self.dirty = True
+            return
+        # Coalesce whole frames. The console sends no ArtSync, so the bridge
+        # finds the frame boundary itself: stage each universe and promote the
+        # frame to the live buffer only once every one of this device's
+        # universes has landed. That latch fires on the *last* universe, so the
+        # output it feeds can't lag a frame behind the rest. A short staleness
+        # flush caps the cost of a dropped universe at a frame or two.
+        if self._seen and now - self._frame_started >= FRAME_LATCH_TIMEOUT:
+            self._latch()
+        if not self._seen:
+            self._frame_started = now
+        self._pending[start : start + len(chunk)] = chunk
+        self._seen.add(start)
+        if len(self._seen) >= self._nsegments:
+            self._latch()
+
+    def _latch(self) -> None:
+        """Promote the staged frame to the live buffer in one shot — no tearing."""
+        self.buffer[:] = self._pending
+        self.dirty = True
+        self._seen.clear()
 
     def has_data(self, now: float) -> bool:
         return self.ever_had_data and now - self.last_rx < self.cfg.loss_timeout
 
     def wants_rt(self, now: float) -> bool:
-        if self.scanning(now) or self.has_data(now):
+        if self._pinned or self.scanning(now) or self.has_data(now):
             return True
         return self.ever_had_data and self.cfg.on_loss in ("hold", "black")
 
@@ -267,16 +309,46 @@ class DeviceRunner:
             return
         if frame is None:
             frame = self.render(black)
+        packets = build_packets(self.protocol, self.client.token, frame, self.out_pixels)
+        addr = (self.cfg.ip, self.cfg.rt_port)
+        self._cancel_paced()  # a newer frame replaces whatever is left of the last one
+        gap = self._packet_gap(len(packets))
+        loop = _running_loop() if gap > 0 else None
         ok = True
-        for packet in build_packets(self.protocol, self.client.token, frame, self.out_pixels):
-            if not self.sender(packet, (self.cfg.ip, self.cfg.rt_port)):
-                ok = False
+        if loop is None:
+            for packet in packets:
+                if not self.sender(packet, addr):
+                    ok = False
+        else:
+            # Spread the frame's packets out instead of firing them back-to-back:
+            # the controller can lose the tail of a burst (the end of the frame).
+            ok = self.sender(packets[0], addr)
+            self._paced = [
+                loop.call_later(gap * i, self._send_paced, packet, addr) for i, packet in enumerate(packets[1:], 1)
+            ]
         if ok:
             self.tx.hit(now)
         else:
             self.send_errors += 1
         self.last_send = now
         self.dirty = False
+
+    def _packet_gap(self, packets: int) -> float:
+        """Seconds between one frame's packets: the configured gap, capped so the
+        whole frame goes out within half a frame period (the next frame cancels
+        anything still queued, so a longer spread would starve the last packet)."""
+        if packets < 2 or self.cfg.packet_gap_ms <= 0:
+            return 0.0
+        return min(self.cfg.packet_gap_ms / 1000.0, 0.5 / self.cfg.fps / (packets - 1))
+
+    def _send_paced(self, packet: bytes, addr: tuple[str, int]) -> None:
+        if not self.sender(packet, addr):
+            self.send_errors += 1
+
+    def _cancel_paced(self) -> None:
+        for handle in self._paced:
+            handle.cancel()
+        self._paced = []
 
     def frame_step(self, now: float) -> None:
         """Called at cfg.fps. Sends a frame when there is something to send."""
@@ -292,7 +364,7 @@ class DeviceRunner:
         if self.has_data(now):
             if self.dirty or now - self.last_send >= KEEPALIVE:
                 self.send_frame(now)
-        elif self.cfg.on_loss == "hold":
+        elif self.cfg.on_loss == "hold" or self._pinned:
             if now - self.last_send >= KEEPALIVE:
                 self.send_frame(now)
         elif self.cfg.on_loss == "black":
@@ -302,9 +374,13 @@ class DeviceRunner:
     # -- control -------------------------------------------------------------
 
     def reassert(self) -> None:
-        """Re-check rt mode on the next control tick instead of waiting for the
-        next MODE_CHECK poll. Backs the "reassert realtime" button, for when a
-        controller has dropped back to its own stored content mid-show."""
+        """Seize realtime now, on the next control tick. Backs the "reassert
+        realtime" button, for when a controller has dropped back to its own
+        stored content mid-show. Unlike the periodic check, this trusts nothing
+        the controller reports: it re-issues rt and pushes a frame even if the
+        device still claims it is live (some sit on their own content while
+        answering "rt"), arms a controller that was never streaming, and pins it
+        so input loss can't hand it back."""
         self._reassert = True
 
     async def connect(self) -> None:
@@ -353,7 +429,23 @@ class DeviceRunner:
         want = self.wants_rt(now)
         forced = self._reassert  # a "reassert realtime" button press
         self._reassert = False
-        if want and not self.rt_armed:
+        if forced:
+            # The operator pressed "reassert": seize control now and hold it.
+            # Trust nothing the controller reports — some units sit on their own
+            # stored content while still answering "rt" — so arm if needed,
+            # re-issue rt and push a frame unconditionally, and pin so input loss
+            # can't hand it back until the bridge restarts.
+            if not self.rt_armed:
+                mode = await self.client.get_mode()
+                if mode and mode != "rt":
+                    self.previous_mode = mode
+            await self.client.set_mode("rt")
+            self.rt_armed = True
+            self._pinned = True
+            self._mode_checked = now
+            self.send_frame(now)
+            log.info("%s: realtime reasserted (forced)", self.name)
+        elif want and not self.rt_armed:
             mode = await self.client.get_mode()
             if mode and mode != "rt":
                 self.previous_mode = mode
@@ -367,24 +459,21 @@ class DeviceRunner:
             await self.client.set_mode(back)
             self.rt_armed = False
             log.info("%s: no data for %.0fs, handed back to '%s' mode", self.name, self.cfg.loss_timeout, back)
-        elif self.rt_armed and (forced or now - self._mode_checked >= MODE_CHECK):
+        elif self.rt_armed and now - self._mode_checked >= MODE_CHECK:
             self._mode_checked = now
             mode = await self.client.get_mode()
             if mode != "rt":
-                log.warning(
-                    "%s: device left rt mode (now '%s'), %s",
-                    self.name,
-                    mode,
-                    "reasserting" if forced else "switching back",
-                )
+                log.warning("%s: device left rt mode (now '%s'), switching back", self.name, mode)
                 await self.client.set_mode("rt")
                 self.send_frame(now)  # light it again immediately, don't wait for the next keepalive
-            elif forced:
-                log.info("%s: realtime reasserted, already live", self.name)
         if self.scanning(now) and self.rt_armed:
             self.state = f"mapping scan (pass {self.scan.status(now)['pass']}/{self.scan.repeat})"
         elif self.rt_armed:
-            self.state = "streaming" if self.has_data(now) else f"no input ({self.cfg.on_loss})"
+            self.state = (
+                "streaming"
+                if self.has_data(now)
+                else ("holding (reasserted)" if self._pinned else f"no input ({self.cfg.on_loss})")
+            )
         else:
             self.state = "released" if self.ever_had_data else "ready, waiting for input"
 
@@ -450,6 +539,7 @@ class DeviceRunner:
         if self._tasks:
             await asyncio.gather(*self._tasks, return_exceptions=True)
         self._tasks = []
+        self._cancel_paced()
         if release and self.rt_armed and self.client is not None:
             try:
                 await asyncio.wait_for(self.client.set_mode(self.previous_mode or "movie"), 2.0)
@@ -473,9 +563,11 @@ class DeviceRunner:
             "input": self.cfg.input,
             "order": self.order or self.cfg.order,
             "fps": self.cfg.fps,
+            "packet_gap_ms": self.cfg.packet_gap_ms,
             "on_loss": self.cfg.on_loss,
             "udp_protocol": self.protocol if self.info else None,
             "previous_mode": self.previous_mode,
+            "pinned": self._pinned,
             "info": self.info.to_dict() if self.info else None,
             "rx": self.rx.to_dict(now),
             "tx": self.tx.to_dict(now),

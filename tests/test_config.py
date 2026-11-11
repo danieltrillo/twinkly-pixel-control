@@ -53,6 +53,20 @@ def test_defaults_apply_and_device_overrides():
     assert (b.fps, b.order) == (40, "GRBW")
 
 
+def test_packet_gap_defaults_on_and_can_be_overridden():
+    c = cfg(
+        [
+            {"name": "A", "ip": "10.0.0.1", "universe": 0, "pixels": 10},
+            {"name": "B", "ip": "10.0.0.2", "universe": 1, "pixels": 10, "packet_gap_ms": 0},
+        ]
+    )
+    assert [d.packet_gap_ms for d in c.devices] == [1.0, 0.0]
+    c = cfg([{"name": "A", "ip": "10.0.0.1", "universe": 0, "pixels": 10}], defaults={"packet_gap_ms": 2.5})
+    assert c.devices[0].packet_gap_ms == 2.5
+    with pytest.raises(ConfigError, match="defaults.packet_gap_ms"):
+        cfg([{"name": "A", "ip": "10.0.0.1", "universe": 0, "pixels": 10}], defaults={"packet_gap_ms": 50})
+
+
 def test_sacn_device_needs_sacn_input():
     with pytest.raises(ConfigError, match="input.sacn is off"):
         cfg([{"ip": "10.0.0.1", "universe": 1, "pixels": 10, "protocol": "sacn"}])

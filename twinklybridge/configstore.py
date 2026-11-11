@@ -44,8 +44,10 @@ DEVICE_ORDER = (
     "start_channel",
     "pixels_per_universe",
     "fps",
+    "packet_gap_ms",
     "on_loss",
     "loss_timeout",
+    "coalesce",
     "enabled",
     "http_port",
     "rt_port",
@@ -82,8 +84,8 @@ _INT_KEYS = {
     "passes",
     "decode_width",
 }
-_FLOAT_KEYS = {"fps", "loss_timeout", "slot"}
-_BOOL_KEYS = {"enabled", "artnet", "sacn", "keep_clips"}
+_FLOAT_KEYS = {"fps", "packet_gap_ms", "loss_timeout", "slot"}
+_BOOL_KEYS = {"enabled", "artnet", "sacn", "keep_clips", "coalesce"}
 _LAYOUT_KEYS = {"input", "order"}
 _TRUE = ("true", "yes", "on", "1")
 _FALSE = ("false", "no", "off", "0")
@@ -474,6 +476,7 @@ def describe(raw: dict, path: str) -> dict:
                 "input": d.input,
                 "order": d.order,
                 "fps": d.fps,
+                "packet_gap_ms": d.packet_gap_ms,
                 "on_loss": d.on_loss,
                 "loss_timeout": d.loss_timeout,
                 "start_channel": d.start_channel,

@@ -138,13 +138,13 @@ def test_set_sections():
         r,
         {
             "input": {"cidr": "10.0.0.2/24", "artnet": "true", "sacn": "on", "reply": "", "short_name": "Bridge"},
-            "defaults": {"fps": "25.5", "order": "wrgb", "on_loss": "black"},
+            "defaults": {"fps": "25.5", "packet_gap_ms": "1.5", "order": "wrgb", "on_loss": "black"},
             "log_level": "debug",
             "mapping": {"brightness": "", "keep_clips": "false"},
         },
     )
     assert r["input"] == {"cidr": "10.0.0.2/24", "artnet": True, "sacn": True, "short_name": "Bridge"}
-    assert r["defaults"] == {"fps": 25.5, "order": "WRGB", "on_loss": "black"}
+    assert r["defaults"] == {"fps": 25.5, "packet_gap_ms": 1.5, "order": "WRGB", "on_loss": "black"}
     assert r["log_level"] == "debug" and r["mapping"] == {"keep_clips": False}
     configstore.set_sections(r, {"mapping": {}})
     assert "mapping" not in r

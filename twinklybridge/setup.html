@@ -94,6 +94,7 @@
         <label class="f">console pixel layout <input type="text" data-k="input" placeholder="RGBW" list="layouts"></label>
         <label class="f">wire order to the Twinkly <input type="text" data-k="order" placeholder="auto" list="orders"></label>
         <label class="f">fps <input type="number" data-k="fps" min="1" max="60" step="0.5"></label>
+        <label class="f" title="Milliseconds between the UDP packets of one frame. Back-to-back packets can make a controller lose the end of the frame.">packet gap (ms) <input type="number" data-k="packet_gap_ms" min="0" max="10" step="0.5"></label>
         <label class="f">when input stops <select data-k="on_loss"><option value="">(default)</option><option value="hold">hold the last look</option><option value="black">go black</option><option value="release">release to the app's effect</option></select></label>
         <label class="f">loss timeout (s) <input type="number" data-k="loss_timeout" min="0.5" max="3600" step="0.5"></label>
         <label class="f">start channel <input type="number" data-k="start_channel" min="1" max="512"></label>
@@ -131,6 +132,7 @@
       <label class="f">console pixel layout <input type="text" data-k="input" placeholder="RGBW" list="layouts"></label>
       <label class="f">wire order to the Twinkly <input type="text" data-k="order" placeholder="auto" list="orders"></label>
       <label class="f">fps <input type="number" data-k="fps" min="1" max="60" step="0.5" placeholder="25"></label>
+      <label class="f" title="Milliseconds between the UDP packets of one frame. Back-to-back packets can make a controller lose the end of the frame. 0 = no gap.">packet gap (ms) <input type="number" data-k="packet_gap_ms" min="0" max="10" step="0.5" placeholder="1"></label>
       <label class="f">when input stops <select data-k="on_loss"><option value="">hold the last look</option><option value="hold">hold the last look</option><option value="black">go black</option><option value="release">release to the app's effect</option></select></label>
       <label class="f">loss timeout (s) <input type="number" data-k="loss_timeout" min="0.5" max="3600" step="0.5" placeholder="5"></label>
       <label class="f">protocol <select data-k="protocol"><option value="">Art-Net if on, else sACN</option><option value="artnet">Art-Net</option><option value="sacn">sACN</option></select></label>
@@ -337,6 +339,7 @@ function openEditor(spec, name) {
   fill($("edform"), { enabled: true, ...spec });
   const d = state.defaults || {};
   $("edform").querySelector("[data-k=fps]").placeholder = d.fps || 25;
+  $("edform").querySelector("[data-k=packet_gap_ms]").placeholder = d.packet_gap_ms ?? 1;
   $("edform").querySelector("[data-k=loss_timeout]").placeholder = d.loss_timeout || 5;
   $("edform").querySelector("[data-k=input]").placeholder = d.input || "RGBW";
   $("edform").querySelector("[data-k=order]").placeholder = d.order || "auto";
