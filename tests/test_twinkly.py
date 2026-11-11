@@ -110,3 +110,40 @@ def test_result_code_both_shapes():
     assert result_code({"code": 1000}) == 1000
     assert result_code({"result": {"code": 1000}}) == 1000
     assert result_code({"mode": "rt"}) is None
+
+
+def test_discover_asks_every_target_and_dedupes_by_sender():
+    import socket
+    import threading
+
+    import pytest
+
+    from twinklybridge.twinkly import DISCOVERY_PORT, discover
+
+    server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        server.bind(("127.0.0.1", DISCOVERY_PORT))
+    except OSError:
+        server.close()
+        pytest.skip("UDP 5555 is taken on this machine")
+    server.settimeout(1.0)
+    asked = []
+
+    def answer():
+        while True:
+            try:
+                data, addr = server.recvfrom(64)
+            except OSError:
+                return
+            asked.append(data)
+            server.sendto(b"\x7f\x00\x00\x01TPFake tree\x00", addr)
+
+    thread = threading.Thread(target=answer, daemon=True)
+    thread.start()
+    try:
+        found = discover(["127.0.0.1", "127.0.0.1"], timeout=0.7)
+    finally:
+        server.close()
+        thread.join(timeout=2)
+    assert [(d.ip, d.name, d.http_port) for d in found] == [("127.0.0.1", "Fake tree", 80)]
+    assert asked and all(d == b"\x01discover" for d in asked)

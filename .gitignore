@@ -8,3 +8,4 @@ dist/
 *.local.yaml
 .DS_Store
 .ruff_cache/
+mapping-data/

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "twinkly-bridge"
-version = "0.1.0"
+version = "0.2.0"
 description = "Art-Net / sACN to Twinkly realtime pixel bridge: drive Twinkly Pro controllers pixel by pixel"
 readme = "README.md"
 license = { text = "MIT" }
@@ -21,7 +21,7 @@ Homepage = "https://github.com/danieltrillo/twinkly-pixel-control"
 include = ["twinklybridge*"]
 
 [tool.setuptools.package-data]
-twinklybridge = ["example-config.yaml", "status.html"]
+twinklybridge = ["example-config.yaml", "*.html"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
