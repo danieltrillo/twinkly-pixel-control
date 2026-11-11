@@ -152,3 +152,95 @@ def test_failed_decode_keeps_the_clip_and_reports(tmp_path):
         await sup.mapstore.stop()
 
     asyncio.run(main())
+
+
+def test_whole_rig_clip_decodes_and_exports_two_lumiverses(tmp_path):
+    import xml.etree.ElementTree as ET
+
+    from twinklybridge.mapstore import RIG, RIG_SLUG
+
+    video = str(tmp_path / "tree.mp4")
+    mapping.main(
+        ["synth", video, "--pixels", "80", "--size", "320", "240", "--blur", "1.5", "--hidden", "0", "--repeat", "1"]
+    )
+    cfg_path = tmp_path / "bridge.yaml"
+    cfg_path.write_text(CONFIG)
+
+    def seg(u, n):
+        return [{"universe": u, "channel": 0, "first_pixel": 0, "count": n}]
+
+    rig = {
+        "kind": "twinkly-rig",
+        "version": 1,
+        "created": 1.0,
+        "total": 80,
+        "slot": 0.4,
+        "pass_seconds": 20.0,
+        "devices": [
+            {
+                "name": "Tree A",
+                "ip": "10.0.0.5",
+                "offset": 0,
+                "pixels": 50,
+                "channels": 4,
+                "feed": "",
+                "segments": seg(0, 50),
+            },
+            {
+                "name": "Tree B",
+                "ip": "10.0.0.6",
+                "offset": 50,
+                "pixels": 30,
+                "channels": 4,
+                "feed": "",
+                "segments": seg(256, 30),
+            },
+        ],
+        "skipped": [],
+    }
+
+    async def upload(client):
+        with open(video, "rb") as fh:
+            fd = aiohttp.FormData()
+            fd.add_field("device", RIG)
+            fd.add_field("label", "front")
+            fd.add_field("clip", fh, filename="tree.mp4", content_type="video/mp4")
+            r = await client.post("/api/map/upload", data=fd)
+        return r.status, await r.json()
+
+    async def main():
+        sup = Supervisor(str(cfg_path))
+        sup.config = load_config(str(cfg_path))
+        sup.mapstore = MapStore(sup.config.mapping, str(cfg_path), root=str(tmp_path / "data"))
+        await sup.mapstore.start()
+        async with TestClient(TestServer(make_app(sup))) as client:
+            status, j = await upload(client)
+            assert status == 400 and "whole-rig scan first" in j["error"]  # nothing to decode against yet
+
+            sup.mapstore.note_rig_scan(rig)
+            status, j = await upload(client)
+            assert status == 200 and j["ok"], j
+            job = j["job"]
+            assert job["slug"] == RIG_SLUG and job["pixels"] == 80 and job["rig"]["controllers"] == 2
+            done = await _wait_job(client, job["id"])
+            assert done["status"] == "done", done
+            assert done["result"]["found"] >= 78
+            assert "rig.json" in done["files"]
+
+            exp = f"/api/map/export/{RIG_SLUG}/{done['id']}"
+            r = await client.get(exp + "/resolume.xml")
+            assert r.status == 200, await r.text()
+            root = ET.fromstring(await r.text())
+            screens = root.findall(".//DmxScreen")
+            assert len(screens) == 2
+            names = [s.find(".//DmxSlice/Params/Param[@name='Name']").get("value") for s in screens]
+            assert names[0].startswith("Tree A ") and names[1].startswith("Tree B ")
+            r = await client.get(exp + "/canvas.png")
+            assert r.status == 200 and r.content_type == "image/png"
+            assert r.headers["Content-Disposition"].startswith("inline")
+
+            r = await client.post("/api/map/solve", json={"device": RIG})
+            assert r.status == 409  # one clip is not enough for 3D
+        await sup.mapstore.stop()
+
+    asyncio.run(main())

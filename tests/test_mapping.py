@@ -196,3 +196,101 @@ def test_solve3d_rejects_the_same_view_twice(tmp_path):
     with pytest.raises(SystemExit) as exc:
         pixelmap.main(["solve3d", *paths, "--out", str(tmp_path / "3d")])
     assert "different spots" in str(exc.value)
+
+
+# -- whole rig: unwrap + one lumiverse per Art-Net net ----------------------------
+
+
+def test_unwrap_cylinder_angle_and_height():
+    ang = np.linspace(-math.pi + 0.05, math.pi - 0.05, 200)
+    h = np.linspace(-1, 1, 200)
+    r = 0.5 + 0.3 * (1 - h)  # a cone, wider at the bottom
+    xyz = np.stack([r * np.sin(ang) + 0.2, h, r * np.cos(ang) - 0.1], axis=1)  # trunk off-centre
+    u, v = pixelmap.unwrap_cylinder(xyz)
+    assert np.allclose(u, (ang + math.pi) / (2 * math.pi), atol=0.02)  # front (+Z) lands mid-canvas
+    assert v[np.argmax(h)] == 0 and abs(v[np.argmin(h)] - 1) < 1e-9  # top of the tree at the top
+
+
+def _rig_manifest(path, devices):
+    rig = {"kind": "twinkly-rig", "version": 1, "total": 0, "slot": 0.4, "devices": [], "skipped": []}
+    off = 0
+    for name, uni, n in devices:
+        segs, first, u = [], 0, uni
+        while first < n:
+            c = min(128, n - first)
+            segs.append({"universe": u, "channel": 0, "first_pixel": first, "count": c})
+            first, u = first + c, u + 1
+        rig["devices"].append(
+            {"name": name, "ip": "10.0.0.9", "offset": off, "pixels": n, "channels": 4, "feed": "", "segments": segs}
+        )
+        off += n
+    rig["total"] = off
+    path.write_text(json.dumps(rig))
+    return rig
+
+
+def test_export_whole_rig_splits_lumiverses_by_net(tmp_path):
+    xyz, _ = _cone_tree(400)
+    # A: 250 px on 0.15.14-0.15.15; B: 150 px from 1.0.0 (the second lumiverse)
+    rig = tmp_path / "rig.json"
+    _rig_manifest(rig, [("Tree A", 254, 250), ("Tree B", 256, 150)])
+    found = [{"pixel": i, "x": float(p[0]), "y": float(p[1]), "z": float(p[2])} for i, p in enumerate(xyz)]
+    m = tmp_path / "map.json"
+    m.write_text(json.dumps({"pixels": 400, "dims": 3, "found": found}))
+    res, png = tmp_path / "r.xml", tmp_path / "canvas.png"
+    pixelmap.main(["export", str(m), "--rig", str(rig), "--resolume", str(res), "--preview", str(png)])
+    root = ET.parse(res).getroot()
+    assert root.find("versionInfo").get("minorVersion") == "24"
+    screens = root.findall(".//DmxScreen")
+    assert [s.get("LumiverseId") for s in screens] == ["0", "1"]
+    a, b = screens
+    assert len(a.findall(".//DmxSlice")) == 250 and len(b.findall(".//DmxSlice")) == 150
+
+    def params(screen, name):
+        return [p.get("value") for p in screen.iter("ParamRange") if p.get("name") == name]
+
+    assert params(a, "Subnet") == ["15"] and params(a, "Universe") == ["14"]  # starts at 0.15.14
+    assert params(b, "Subnet") == ["0"] and params(b, "Universe") == ["0"]  # 1.0.0 -> its own output
+    starts_a = [float(v) for v in params(a, "Start Channel")]
+    assert starts_a[0] == 1 and starts_a[1] == 5 and starts_a[128] == 513
+    assert float(params(b, "Start Channel")[0]) == 1
+    names = [s.find(".//Param[@name='Name']").get("value") for s in b.findall(".//DmxSlice")]
+    assert names[0] == "Tree B 1" and names[-1] == "Tree B 150"
+    for s in root.iter("InputRect"):
+        for v in s.iter("v"):
+            assert 0 <= float(v.get("x")) <= 1920 and 0 <= float(v.get("y")) <= 1080
+    assert {p.get("value") for p in root.iter("ParamChoice") if p.get("name") == "Color Format"} == {"rgbw"}
+    assert {p.get("value") for p in root.iter("Param") if p.get("name") == "TargetIP"} == {"TT_DISABLED"}
+    img = cv2.imread(str(png))
+    assert img is not None and img.shape[1] == 1280
+
+
+def test_export_rig_skips_pixels_no_universe_carries(tmp_path):
+    rig = tmp_path / "rig.json"
+    r = _rig_manifest(rig, [("Tree A", 0, 10)])
+    r["devices"][0]["segments"][0]["count"] = 6  # patched for 6, the controller shows 10
+    rig.write_text(json.dumps(r))
+    found = [{"pixel": i, "x": float(i), "y": 0.0} for i in range(10)]
+    m = tmp_path / "map.json"
+    m.write_text(json.dumps({"pixels": 10, "dims": 2, "found": found}))
+    res = tmp_path / "r.xml"
+    pixelmap.main(["export", str(m), "--rig", str(rig), "--resolume", str(res)])
+    assert len(ET.parse(res).getroot().findall(".//DmxSlice")) == 6
+
+
+def test_solve3d_places_cameras_from_a_sample_then_triangulates_everything(tmp_path):
+    xyz, normals = _cone_tree(600)
+    n = len(xyz)
+    yaws = [i * 2 * math.pi / 6 for i in range(6)]
+    paths = _orbit_views(tmp_path, xyz, normals, yaws, fov=64.0, occlude=True)
+    out = tmp_path / "3d"
+    scale = str(np.linalg.norm(xyz[0] - xyz[-1]))
+    pixelmap.main(
+        ["solve3d", *paths, "--fov", "64", "--max-points", "150", "--out", str(out), "--scale", "1", str(n), scale]
+    )
+    got = json.loads((out / "map.json").read_text())
+    docs = [json.load(open(q)) for q in paths]
+    seen_by_two = sum(1 for p in range(n) if sum(p in {f["pixel"] for f in d["found"]} for d in docs) >= 2)
+    assert len(got["found"]) >= 0.97 * seen_by_two  # all of them, not just the 150
+    err, up, _ = _shape_error(got, xyz)
+    assert err < 0.02 and up > 0.99

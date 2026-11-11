@@ -15,8 +15,8 @@ from aiohttp import web
 
 from . import configstore, mapping
 from .config import MAP_COLORS, ConfigError, parse_config
-from .engine import DeviceRunner, ScanError
-from .mapstore import StoreError
+from .engine import DeviceRunner, ScanError, start_rig_scan
+from .mapstore import RIG, StoreError
 from .twinkly import HTTP_PORT, Discovered, NotFound, TwinklyClient, TwinklyError, discover, local_networks
 
 if TYPE_CHECKING:
@@ -135,6 +135,8 @@ async def api_map_state(request: web.Request) -> web.Response:
                     "error": sup.config_error,
                 }
             )
+    if sup.engine is not None and devices:
+        devices.insert(0, _rig_state(sup.engine.devices, store, now))
     cfg = store.cfg
     return web.json_response(
         {
@@ -158,6 +160,39 @@ async def api_map_state(request: web.Request) -> web.Response:
     )
 
 
+def _rig_state(devs, store, now: float) -> dict:
+    """The "whole rig" entry at the top of the controller list."""
+    ready = [d for d in devs if d.ready]
+    scans = [d.scan for d in devs if d.scanning(now) and d.scan.rig]
+    scan = None
+    if scans:
+        scan = dict(scans[0].status(now))
+        scan["pixels"] = scans[0].total
+        scan["controllers"] = len(scans)
+    rig = store.rig_manifest()
+    last = None
+    if rig:
+        last = {
+            "controllers": len(rig["devices"]),
+            "pixels": rig["total"],
+            "skipped": rig.get("skipped", []),
+            "created": rig.get("created"),
+        }
+    not_ready = [f"{d.name} ({d.state})" for d in devs if not d.ready]
+    return {
+        "name": RIG,
+        "ip": f"{len(ready)}/{len(devs)} ready",
+        "state": f"{len(ready)} of {len(devs)} controllers ready",
+        "ready": bool(ready),
+        "pixels": sum(d.out_pixels for d in ready),
+        "scan": scan,
+        "warnings": [f"not ready: {', '.join(not_ready)}"] if not_ready else [],
+        "error": "",
+        "rig": True,
+        "last_scan": last,
+    }
+
+
 async def api_map_scan(request: web.Request) -> web.Response:
     store = _store(request)
     try:
@@ -165,8 +200,8 @@ async def api_map_scan(request: web.Request) -> web.Response:
     except ValueError:
         return _fail("expected JSON")
     name = str(body.get("device") or "")
-    dev = _device(request, name)
-    if dev is None:
+    dev = _device(request, name) if name != RIG else None
+    if dev is None and name != RIG:
         return _fail(f"no running device named {name!r}", 404)
     cfg = store.cfg
     try:
@@ -178,6 +213,26 @@ async def api_map_scan(request: web.Request) -> web.Response:
         return _fail("slot, brightness and passes must be numbers")
     if not 0.1 <= slot <= 2.0 or not 1 <= brightness <= 255 or not 1 <= passes <= 100 or color not in MAP_COLORS:
         return _fail("slot 0.1-2 s, brightness 1-255, passes 1-100, colour white/rgb/green")
+    if name == RIG:
+        engine = request.app["supervisor"].engine
+        if engine is None:
+            return _fail("the bridge is not running", 409)
+        if any(d.scanning(time.monotonic()) for d in engine.devices):
+            return _fail("a scan is already running; stop it first", 409)
+        try:
+            manifest = start_rig_scan(engine.devices, slot=slot, brightness=brightness, color=color, repeat=passes)
+        except ScanError as exc:
+            return _fail(str(exc), 409)
+        store.note_rig_scan(manifest)
+        return web.json_response(
+            {
+                "ok": True,
+                "controllers": len(manifest["devices"]),
+                "pixels": manifest["total"],
+                "skipped": manifest["skipped"],
+                "pass_seconds": manifest["pass_seconds"],
+            }
+        )
     try:
         job = dev.start_scan(slot=slot, brightness=brightness, color=color, repeat=passes)
     except ScanError as exc:
@@ -191,7 +246,14 @@ async def api_map_scan_stop(request: web.Request) -> web.Response:
         body = await request.json()
     except ValueError:
         return _fail("expected JSON")
-    dev = _device(request, str(body.get("device") or ""))
+    name = str(body.get("device") or "")
+    if name == RIG:
+        engine = request.app["supervisor"].engine
+        for d in engine.devices if engine is not None else []:
+            if d.scan is not None and d.scan.rig:
+                d.stop_scan()
+        return web.json_response({"ok": True})
+    dev = _device(request, name)
     if dev is None:
         return _fail("no such running device", 404)
     dev.stop_scan()
@@ -219,16 +281,18 @@ async def api_map_upload(request: web.Request) -> web.Response:
         elif part.name == "clip":
             if not device:
                 return _fail("send the device field before the clip")
-            dev = _device(request, device)
-            if dev is not None:
+            dev = _device(request, device) if device != RIG else None
+            if device == RIG:
+                fallback = 0
+            elif dev is not None:
                 fallback = dev.out_pixels
             else:
                 known = {c.name: c for c in sup.config.devices} if sup.config else {}
                 if device not in known:
                     return _fail(f"no device named {device!r} in the config", 404)
                 fallback = known[device].pixels
-            settings = store.settings_for(device, fallback)
             try:
+                settings = store.settings_for(device, fallback)
                 job = await store.save_upload(
                     device, label, part.filename or "", part, settings["pixels"], settings["slot"]
                 )
@@ -284,8 +348,9 @@ async def api_map_export(request: web.Request) -> web.Response:
         path = await store.export(slug, source, kind)
     except StoreError as exc:
         return _fail(str(exc), 409)
-    filename = f"{slug}-{source}-{kind}" if kind not in ("map.json", "map.csv") else f"{slug}-{source}-{kind}"
-    return web.FileResponse(path, headers={**NO_CACHE, "Content-Disposition": f'attachment; filename="{filename}"'})
+    filename = f"{slug.strip('_') or 'map'}-{source}-{kind}"
+    disposition = "inline" if kind.endswith(".png") else "attachment"
+    return web.FileResponse(path, headers={**NO_CACHE, "Content-Disposition": f'{disposition}; filename="{filename}"'})
 
 
 # --------------------------------------------------------------------------
