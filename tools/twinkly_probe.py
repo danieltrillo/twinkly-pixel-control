@@ -16,6 +16,7 @@ Usage:
   python3 twinkly_probe.py chunks <controller-ip> [--hold 8]     # which output is which
   python3 twinkly_probe.py scan  <controller-ip> [--slot 0.4] [--brightness 96] [--repeat 2]
                                                   # blink code for camera mapping (tools/pixelmap.py)
+  python3 twinkly_probe.py artnet <controller-ip> [--off | --on]   # the built-in Art-Net mode (Pro)
 
 Reference: https://xled-docs.readthedocs.io/en/latest/protocol_details.html
 """
@@ -621,10 +622,55 @@ def run_scan(dev, fps, order, proto_override, slot, brightness, color, repeat, c
             print(f"\n  couldn't restore mode ({e}) - pick a movie in the app")
 
 
+# ------------------------------------------------------------------- artnet --
+def run_artnet(dev, switch):
+    """Show the built-in Art-Net setting; with --off/--on try the POST bodies the firmware may take."""
+    g = dev.detect()
+    dev.login()
+    print(f"  {g.get('device_name', '?')} ({dev.api}), gestalt artnet_en = {g.get('artnet_en')!r}")
+    try:
+        cur = dev.get("/artnet/config")
+    except NotFound:
+        sys.exit("  no /artnet/config on this firmware")
+    print(f"  GET artnet/config -> {json.dumps(cur)}")
+    if switch is None:
+        return
+    want = switch == "on"
+    settings = {k: v for k, v in cur.items() if k not in ("code", "result")}
+    attempts = [
+        {"enable": want},
+        {"enable": int(want)},
+        {**settings, "enable": want},
+        {**settings, "enable": int(want)},
+        {"enabled": want},
+        {"artnet_en": want},
+    ]
+    seen = []
+    for body in attempts:
+        if body in seen:
+            continue
+        seen.append(body)
+        try:
+            reply = dev.post("/artnet/config", body)
+        except RuntimeError as e:
+            print(f"  POST {json.dumps(body)} -> {e}")
+            continue
+        print(f"  POST {json.dumps(body)} -> {json.dumps(reply)}")
+        if code(reply) == 1000:
+            after = dev.get("/artnet/config")
+            g2 = dev.detect() if dev.gestalt is None else dev.get("/gestalt", auth=False)
+            print(f"  GET artnet/config -> {json.dumps(after)}; gestalt artnet_en = {g2.get('artnet_en')!r}")
+            if bool(after.get("enable")) == want:
+                print(f"  OK: built-in Art-Net is now {'on' if want else 'off'} (body that worked: {json.dumps(body)})")
+                return
+            print("  accepted, but the setting did not change; trying the next body")
+    sys.exit("  no body was accepted; see the replies above")
+
+
 # --------------------------------------------------------------------- main --
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("command", choices=["info", "test", "locate", "chunks", "scan"])
+    ap.add_argument("command", choices=["info", "test", "locate", "chunks", "scan", "artnet"])
     ap.add_argument("ip")
     ap.add_argument("--fps", type=float, default=40, help="frames per second to send (default 40)")
     ap.add_argument(
@@ -656,6 +702,8 @@ def main():
     )
     ap.add_argument("--repeat", type=int, default=2, help="scan: passes back to back (default 2)")
     ap.add_argument("--countdown", type=int, default=5, help="scan: black seconds before the first pass (default 5)")
+    ap.add_argument("--off", action="store_true", help="artnet: switch the built-in Art-Net mode off")
+    ap.add_argument("--on", action="store_true", help="artnet: switch it on")
     a = ap.parse_args()
 
     dev = Twinkly(a.ip, a.http_port, a.udp_port)
@@ -668,6 +716,8 @@ def main():
             run_scan(dev, a.fps, a.order, a.proto, a.slot, a.brightness, a.color, a.repeat, a.countdown)
         elif a.command == "chunks":
             run_chunks(dev, a.fps, a.order, a.proto, a.hold)
+        elif a.command == "artnet":
+            run_artnet(dev, "off" if a.off else "on" if a.on else None)
         else:
             run_test(dev, a.fps, a.order, a.proto, a.yes, a.hold)
     except RuntimeError as e:
