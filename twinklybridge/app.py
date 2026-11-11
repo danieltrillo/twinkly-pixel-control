@@ -9,7 +9,7 @@ import signal
 import time
 
 from . import __version__
-from .config import Config, ConfigError, MappingConfig, load_config, overlaps
+from .config import Config, ConfigError, MappingConfig, listen_feeds, load_config, overlaps
 from .engine import Engine
 from .mapstore import MapStore
 
@@ -68,12 +68,14 @@ class Supervisor:
             # A change that leaves the listen sockets and protocols the same
             # (enabling/disabling/editing a controller, or a defaults/mapping/
             # log tweak) is applied in place, so the unchanged controllers keep
-            # streaming. Only an input change restarts the whole engine.
+            # streaming. An input change, or a change to the set of Art-Net feed
+            # IPs (which adds or drops a listen socket), restarts the whole engine.
             if (
                 self.engine is not None
                 and self.engine.running
                 and self.config is not None
                 and config.input == self.config.input
+                and set(listen_feeds(config)) == set(listen_feeds(self.config))
             ):
                 self._apply_shared(config)
                 await self.engine.apply_config(config)

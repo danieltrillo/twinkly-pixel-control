@@ -183,9 +183,10 @@ devices:
 | `on_loss` | `hold` | What happens when input stops: `hold` keeps the last look, `black` goes dark, `release` hands back to the app's effect. |
 | `loss_timeout` | `5` | Seconds without input before `on_loss` kicks in. |
 | `enabled` | `true` | Set to `false` to leave a controller alone. |
+| `listen_ip` | input IP | Art-Net only. The bridge IP this controller's universes arrive on. Set different feed IPs to carry more than 256 universes (see below). |
 
-Any device key except `name`, `ip`, `universe`, `pixels` and `enabled` can go
-under `defaults:`.
+Any device key except `name`, `ip`, `universe`, `pixels`, `enabled` and
+`listen_ip` can go under `defaults:`.
 
 ## Patch it
 
@@ -201,6 +202,24 @@ IP. Then use layouts and the Bitmap/pixel mapper as usual.
 **Turn off Twinkly's own Art-Net mode** on the controllers (Twinkly app →
 Device → Advanced). If it's on and listening to the same universes, it fights
 the bridge.
+
+### More than 256 universes (Resolume)
+
+Resolume Arena only exposes **Sub-Net + Universe**, not the Art-Net **Net**
+field, so one of its outputs tops out at **256 universes** (128 RGBW pixels
+each = 32,768 pixels) per destination IP. To go past that without changing
+consoles:
+
+1. Give the bridge box a second IP on the Art-Net VLAN (an interface alias).
+2. Add a second Resolume Art-Net output set to **unicast** to that IP, numbered
+   from universe 0 again.
+3. Set `listen_ip:` on the controllers fed by that output to the second IP.
+
+Each `listen_ip` is its own universe space, so universe `0.0.0` on one IP and
+`0.0.0` on another are different strands. Controllers with no `listen_ip` use
+the main input IP. The bridge binds one listen socket per IP, so the input IP
+must be a real address (not `0.0.0.0`) once you split. Madrix and grandMA3 can
+address the Net field directly and don't need this.
 
 ## What the bridge does with each controller
 

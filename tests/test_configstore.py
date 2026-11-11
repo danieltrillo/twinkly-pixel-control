@@ -50,6 +50,45 @@ def test_add_devices_assigns_the_next_free_universes():
     assert c.devices[1].universe_label == "0.0.3 - 0.0.14" and c.devices[2].universe_label == "0.0.15"
 
 
+def test_listen_ip_round_trips_for_segmentation():
+    from twinklybridge.config import artnet_feeds
+
+    r = raw()
+    configstore.add_devices(
+        r, [{"name": "Tree 2", "ip": "10.0.0.6", "universe": "0.0.0", "pixels": 300, "listen_ip": "10.0.0.3"}]
+    )
+    assert r["devices"][1]["listen_ip"] == "10.0.0.3"
+    text = configstore.dump(r)
+    assert "listen_ip: 10.0.0.3" in text
+    c = parse_config(configstore.raw_from_text(text))
+    # Tree 1 reuses universe 0.0.0 on the input IP, Tree 2 on its own feed
+    assert c.devices[1].listen_ip == "10.0.0.3"
+    assert set(artnet_feeds(c)) == {"10.0.0.2", "10.0.0.3"}
+    # patch can move the feed, and an empty value clears it
+    configstore.patch_device(r, "Tree 2", {"listen_ip": "10.0.0.4"})
+    assert r["devices"][1]["listen_ip"] == "10.0.0.4"
+    configstore.patch_device(r, "Tree 2", {"listen_ip": ""})
+    assert "listen_ip" not in r["devices"][1]
+
+
+def test_listen_ip_on_sacn_is_rejected():
+    r = {"input": {"cidr": "10.0.0.2/24", "sacn": True}, "devices": []}
+    with pytest.raises(ConfigError):
+        configstore.add_devices(
+            r,
+            [
+                {
+                    "name": "S",
+                    "ip": "10.0.0.5",
+                    "universe": "1",
+                    "pixels": 10,
+                    "protocol": "sacn",
+                    "listen_ip": "10.0.0.3",
+                }
+            ],
+        )
+
+
 def test_universe_is_canonical_per_protocol():
     r = raw()
     configstore.add_devices(r, [{"name": "B", "ip": "10.0.0.6", "universe": "17", "pixels": 10}])

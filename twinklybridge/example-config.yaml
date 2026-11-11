@@ -49,6 +49,16 @@ devices:
   #   fps: 30
   #   on_loss: release
   #   enabled: true
+  #   listen_ip: 2.0.0.20    # see below
+
+# Feeding more than 256 universes (Art-Net):
+# Resolume can set only Sub-Net + Universe, not the Art-Net Net field, so one of
+# its outputs tops out at 256 universes per destination IP. To go past that, give
+# this box a second IP, point a second (unicast) Resolume output at it, and set
+# listen_ip on the controllers it feeds. Each listen_ip is a separate universe
+# space, so universe 0.0.0 on one IP and 0.0.0 on another are different strands.
+# Controllers with no listen_ip use the main input IP above. Leave it unset until
+# you actually exceed 256 universes.
 
 web:
   enabled: true

@@ -98,6 +98,7 @@
         <label class="f">loss timeout (s) <input type="number" data-k="loss_timeout" min="0.5" max="3600" step="0.5"></label>
         <label class="f">start channel <input type="number" data-k="start_channel" min="1" max="512"></label>
         <label class="f">pixels per universe <input type="number" data-k="pixels_per_universe" min="0" max="170" placeholder="as many as fit"></label>
+        <label class="f" title="Art-Net only. The bridge IP this controller's universes arrive on. Set different feed IPs (each fed by its own unicast Resolume output) to carry more than 256 universes.">feed IP (for &gt;256 universes) <input type="text" data-k="listen_ip" placeholder="main input IP" inputmode="decimal"></label>
       </div>
     </details>
     </div>
@@ -266,8 +267,9 @@ function renderDevices() {
     const artnet = run.artnet === true
       ? `<div class="small warn">built-in Art-Net is on: it fights the bridge <button class="sm" data-artnet="${esc(spec.ip)}">Turn it off</button></div>`
       : "";
+    const feed = d && d.listen_ip ? ` · feed ${esc(d.listen_ip)}` : "";
     const line2 = d
-      ? `${esc(d.protocol)} ${esc(d.universes)} · ${d.universe_count} univ · ${d.pixels} px · ${esc(d.input)}→${esc(d.order)} @ ${d.fps} fps`
+      ? `${esc(d.protocol)} ${esc(d.universes)} · ${d.universe_count} univ · ${d.pixels} px · ${esc(d.input)}→${esc(d.order)} @ ${d.fps} fps${feed}`
       : `${esc(spec.universe ?? "?")} · ${esc(spec.pixels ?? "?")} px`;
     return `<div class="dev ${enabled ? "" : "off"}">
       <div class="body">

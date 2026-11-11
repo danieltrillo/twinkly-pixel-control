@@ -16,9 +16,10 @@ import socket
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from functools import partial
 
 from . import __version__, artnet, mapcode, sacn
-from .config import ARTNET, SACN, Config, DeviceConfig, Segment, format_universe
+from .config import ARTNET, SACN, SACN_FEED, Config, DeviceConfig, Segment, artnet_feeds, device_feed, format_universe
 from .pixels import convert
 from .twinkly import AuthError, DeviceInfo, TwinklyClient, TwinklyError, build_packets, protocol_for_firmware
 
@@ -465,6 +466,7 @@ class DeviceRunner:
             "error": self.error,
             "warnings": list(self.warnings),
             "protocol": self.cfg.protocol,
+            "listen_ip": self.cfg.listen_ip,
             "universes": self.cfg.universe_label,
             "universe_count": len(self.cfg.segments),
             "pixels": self.cfg.pixels,
@@ -498,7 +500,7 @@ class _Protocol(asyncio.DatagramProtocol):
             log.exception("error handling a packet from %s", addr[0])
 
 
-def _listen_socket(port: int) -> socket.socket:
+def _listen_socket(port: int, bind_ip: str = "") -> socket.socket:
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     if hasattr(socket, "SO_REUSEPORT"):
@@ -511,7 +513,7 @@ def _listen_socket(port: int) -> socket.socket:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
     except OSError:
         pass
-    sock.bind(("", port))
+    sock.bind((bind_ip, port))
     sock.setblocking(False)
     return sock
 
@@ -574,16 +576,17 @@ class Engine:
         self._own_sender = sender is None
         self.sender: Sender = sender or UdpSender()
         self.devices = [DeviceRunner(cfg=d, sender=self.sender) for d in config.enabled_devices]
-        self._map: dict[tuple[str, int], list[tuple[DeviceRunner, Segment]]] = {}
+        # keyed by (protocol, feed, universe); feed is the listen IP a packet arrives on
+        self._map: dict[tuple[str, str, int], list[tuple[DeviceRunner, Segment]]] = {}
         self._rebuild_map()
         self.ip = config.input.ip if config.input.ip != "0.0.0.0" else guess_local_ip()
-        self.last_rx: dict[tuple[str, int], float] = {}
-        self.unmapped: dict[tuple[str, int], tuple[str, float]] = {}
+        self.last_rx: dict[tuple[str, str, int], float] = {}
+        self.unmapped: dict[tuple[str, str, int], tuple[str, float]] = {}
         self.artnet_rx = RateCounter()
         self.sacn_rx = RateCounter()
         self.polls_rx = 0
         self.dropped: dict[str, int] = {}
-        self._artnet_transport: asyncio.DatagramTransport | None = None
+        self._artnet_transports: dict[str, asyncio.DatagramTransport] = {}
         self._sacn_transport: asyncio.DatagramTransport | None = None
         self._sacn_sock: socket.socket | None = None
         self._session = None
@@ -601,10 +604,18 @@ class Engine:
         self._session = aiohttp.ClientSession()
         if open_sockets:
             if self.config.input.artnet:
-                transport, _ = await loop.create_datagram_endpoint(
-                    lambda: _Protocol(self.handle_artnet), sock=_listen_socket(artnet.ARTNET_PORT)
-                )
-                self._artnet_transport = transport
+                feeds = self._artnet_feeds()
+                segmented = len(feeds) > 1
+                for feed in feeds:
+                    # One feed on the primary IP binds all interfaces (catches broadcast
+                    # too, as before). Segmented feeds each bind their own IP, so Resolume
+                    # can unicast a separate universe-0 space to each.
+                    bind_ip = "" if (not segmented and feed == self.config.input.ip) else feed
+                    transport, _ = await loop.create_datagram_endpoint(
+                        partial(_Protocol, partial(self.handle_artnet, feed=feed)),
+                        sock=_listen_socket(artnet.ARTNET_PORT, bind_ip),
+                    )
+                    self._artnet_transports[feed] = transport
             if self.config.input.sacn:
                 sock = _listen_socket(sacn.SACN_PORT)
                 self._sacn_sock = sock
@@ -618,13 +629,15 @@ class Engine:
         self.running = True
         self.started_at = time.monotonic()
         self.announce()
+        feeds = sorted(self._artnet_transports)
         log.info(
-            "bridge started: %d device(s), %d universe(s), listening as %s (Art-Net %s, sACN %s)",
+            "bridge started: %d device(s), %d universe(s), listening as %s (Art-Net %s, sACN %s)%s",
             len(self.devices),
             len(self._map),
             self.ip,
             "on" if self.config.input.artnet else "off",
             "on" if self.config.input.sacn else "off",
+            f", Art-Net feeds {', '.join(feeds)}" if len(feeds) > 1 else "",
         )
 
     async def stop(self) -> None:
@@ -635,10 +648,11 @@ class Engine:
             await asyncio.gather(*self._tasks, return_exceptions=True)
         self._tasks = []
         await asyncio.gather(*(d.stop() for d in self.devices), return_exceptions=True)
-        for transport in (self._artnet_transport, self._sacn_transport):
+        for transport in (*self._artnet_transports.values(), self._sacn_transport):
             if transport is not None:
                 transport.close()
-        self._artnet_transport = self._sacn_transport = None
+        self._artnet_transports = {}
+        self._sacn_transport = None
         if self._session is not None:
             await self._session.close()
             self._session = None
@@ -646,11 +660,22 @@ class Engine:
             self.sender.close()
         log.info("bridge stopped")
 
+    def _feed(self, cfg: DeviceConfig) -> str:
+        """The listen IP this device's packets arrive on (SACN_FEED for sACN)."""
+        return device_feed(cfg, self.config.input)
+
+    def _artnet_feeds(self) -> list[str]:
+        """Distinct Art-Net listen IPs to bind. Falls back to the input IP so the
+        bridge still answers ArtPoll when no Art-Net device is configured."""
+        feeds = artnet_feeds(self.config)
+        return feeds or [self.config.input.ip]
+
     def _rebuild_map(self) -> None:
         self._map = {}
         for dev in self.devices:
+            feed = self._feed(dev.cfg)
             for seg in dev.cfg.segments:
-                self._map.setdefault((dev.cfg.protocol, seg.universe), []).append((dev, seg))
+                self._map.setdefault((dev.cfg.protocol, feed, seg.universe), []).append((dev, seg))
 
     async def apply_config(self, config: Config) -> None:
         """Update to a new config in place, touching only the controllers that changed.
@@ -713,7 +738,7 @@ class Engine:
 
     def _join_sacn_groups(self, sock: socket.socket) -> None:
         local = self.config.input.ip if self.config.input.ip != "0.0.0.0" else "0.0.0.0"
-        for protocol, universe in self._map:
+        for protocol, _feed, universe in self._map:
             if protocol != SACN:
                 continue
             group = sacn.multicast_address(universe)
@@ -742,12 +767,16 @@ class Engine:
     def _drop(self, reason: str) -> None:
         self.dropped[reason] = self.dropped.get(reason, 0) + 1
 
-    def feed(self, protocol: str, universe: int, data: bytes, source: str, now: float | None = None) -> None:
+    def feed(
+        self, protocol: str, universe: int, data: bytes, source: str, now: float | None = None, feed: str | None = None
+    ) -> None:
         now = time.monotonic() if now is None else now
-        self.last_rx[(protocol, universe)] = now
-        targets = self._map.get((protocol, universe))
+        if feed is None:
+            feed = SACN_FEED if protocol == SACN else self.config.input.ip
+        key = (protocol, feed, universe)
+        self.last_rx[key] = now
+        targets = self._map.get(key)
         if not targets:
-            key = (protocol, universe)
             if key not in self.unmapped:
                 log.info(
                     "%s universe %s from %s is not mapped to a device",
@@ -760,8 +789,9 @@ class Engine:
         for dev, seg in targets:
             dev.write(seg, data, now)
 
-    def handle_artnet(self, data: bytes, src_ip: str) -> None:
-        if src_ip == self.ip:
+    def handle_artnet(self, data: bytes, src_ip: str, feed: str | None = None) -> None:
+        feed = self.config.input.ip if feed is None else feed
+        if src_ip == self.ip or src_ip in self._artnet_transports:
             return  # our own ArtPollReply coming back
         op = artnet.opcode(data)
         if op is None:
@@ -774,14 +804,14 @@ class Engine:
             if dmx is None:
                 self._drop("bad ArtDmx")
                 return
-            self.feed(ARTNET, dmx.universe, dmx.data, src_ip, now)
+            self.feed(ARTNET, dmx.universe, dmx.data, src_ip, now, feed=feed)
         elif op == artnet.OP_POLL:
             poll = artnet.decode_poll(data)
             if poll is not None:
                 self.polls_rx += 1
                 dest = src_ip if self.config.input.reply == "unicast" else self.config.input.broadcast
-                for packet in self.build_poll_replies(poll, now):
-                    self._send_artnet(packet, dest)
+                for packet in self.build_poll_replies(poll, now, feed):
+                    self._send_artnet(packet, dest, feed)
 
     def handle_sacn(self, data: bytes, src_ip: str) -> None:
         packet = sacn.decode_data(data)
@@ -789,28 +819,32 @@ class Engine:
             return
         now = time.monotonic()
         self.sacn_rx.hit(now)
-        self.feed(SACN, packet.universe, packet.data, src_ip, now)
+        self.feed(SACN, packet.universe, packet.data, src_ip, now, feed=SACN_FEED)
 
     # -- ArtPollReply ----------------------------------------------------------
 
-    def _send_artnet(self, packet: bytes, dest: str) -> None:
-        if self._artnet_transport is not None:
+    def _send_artnet(self, packet: bytes, dest: str, feed: str) -> None:
+        transport = self._artnet_transports.get(feed)
+        if transport is not None:
             try:
-                self._artnet_transport.sendto(packet, (dest, artnet.ARTNET_PORT))
+                transport.sendto(packet, (dest, artnet.ARTNET_PORT))
             except OSError as exc:
                 log.debug("ArtPollReply to %s failed: %s", dest, exc)
 
     def announce(self) -> None:
-        for packet in self.build_poll_replies(None, time.monotonic()):
-            self._send_artnet(packet, self.config.input.broadcast)
+        now = time.monotonic()
+        for feed in self._artnet_transports:
+            for packet in self.build_poll_replies(None, now, feed):
+                self._send_artnet(packet, self.config.input.broadcast, feed)
 
-    @property
-    def artnet_universes(self) -> list[int]:
-        return sorted(u for p, u in self._map if p == ARTNET)
+    def _feed_universes(self, feed: str) -> list[int]:
+        return sorted(u for (p, f, u) in self._map if p == ARTNET and f == feed)
 
-    def build_poll_replies(self, poll: artnet.ArtPoll | None, now: float) -> list[bytes]:
-        """One ArtPollReply per group of up to four universes sharing Net and Sub-Net."""
-        ports = [u for u in self.artnet_universes if poll is None or poll.wants(u)]
+    def build_poll_replies(self, poll: artnet.ArtPoll | None, now: float, feed: str | None = None) -> list[bytes]:
+        """One ArtPollReply per group of up to four of this feed's universes sharing Net and Sub-Net."""
+        feed = self.config.input.ip if feed is None else feed
+        node_ip = self.ip if feed in ("0.0.0.0", self.config.input.ip) else feed
+        ports = [u for u in self._feed_universes(feed) if poll is None or poll.wants(u)]
         if not ports and poll is not None and poll.target_top is not None:
             return []
         groups: dict[tuple[int, int], list[int]] = {}
@@ -833,10 +867,10 @@ class Engine:
             for i, pa in enumerate(items):
                 port_types[i] = artnet.PORT_TYPE_OUTPUT
                 sw_out[i] = pa & 0x0F
-                if now - self.last_rx.get((ARTNET, pa), -1e9) < ACTIVE_WINDOW:
+                if now - self.last_rx.get((ARTNET, feed, pa), -1e9) < ACTIVE_WINDOW:
                     good_out[i] = artnet.GOOD_OUTPUT_DATA_TRANSMITTED
             reply = artnet.ArtPollReply(
-                ip=self.ip,
+                ip=node_ip,
                 version=version,
                 net_switch=net,
                 sub_switch=sub,
@@ -851,7 +885,7 @@ class Engine:
                 good_output=bytes(good_out),
                 sw_out=bytes(sw_out),
                 style=artnet.STYLE_NODE,
-                bind_ip=self.ip,
+                bind_ip=node_ip,
                 bind_index=index,
                 status2=artnet.STATUS2_PORT_ADDRESS_15BIT | artnet.STATUS2_WEB_CONFIG,
             )
@@ -872,6 +906,7 @@ class Engine:
                 "broadcast": self.config.input.broadcast,
                 "artnet": self.config.input.artnet,
                 "sacn": self.config.input.sacn,
+                "artnet_feeds": self._artnet_feeds() if self.config.input.artnet else [],
                 "artnet_rx": self.artnet_rx.to_dict(now),
                 "sacn_rx": self.sacn_rx.to_dict(now),
                 "polls_rx": self.polls_rx,
@@ -879,8 +914,14 @@ class Engine:
             },
             "devices": [d.status(now) for d in self.devices],
             "unmapped": [
-                {"protocol": p, "universe": format_universe(p, u), "source": src, "age": round(now - seen, 1)}
-                for (p, u), (src, seen) in sorted(self.unmapped.items())
+                {
+                    "protocol": p,
+                    "feed": f,
+                    "universe": format_universe(p, u),
+                    "source": src,
+                    "age": round(now - seen, 1),
+                }
+                for (p, f, u), (src, seen) in sorted(self.unmapped.items())
             ],
             "dropped": dict(self.dropped),
             "send_errors": getattr(self.sender, "errors", 0),
