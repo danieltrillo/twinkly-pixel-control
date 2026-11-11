@@ -116,6 +116,8 @@ class Twinkly:
     def fw_path(self):
         return "/fw/ct1/version" if self.api == "v2" else "/fw/version"
 
+    role = None
+
     def login(self):
         self.detect()
         challenge = base64.b64encode(os.urandom(32)).decode()
@@ -124,6 +126,7 @@ class Twinkly:
             raise RuntimeError(f"login failed: {r}")
         self.token = r["authentication_token"]
         self.token_raw = base64.b64decode(self.token)
+        self.role = r.get("auth-role")  # Pro firmware 4.x says "user"
         v = self.post("/verify", {"challenge-response": r.get("challenge-response", "")})
         if code(v) != 1000:
             raise RuntimeError(f"verify failed: {v}")
@@ -630,12 +633,31 @@ def run_artnet(dev, switch, explore=False):
     rejected one changes nothing. --explore also probes nearby routes and methods."""
     g = dev.detect()
     dev.login()
-    print(f"  {g.get('device_name', '?')} ({dev.api}), gestalt artnet_en = {g.get('artnet_en')!r}")
+    print(
+        f"  {g.get('device_name', '?')} ({dev.api}), gestalt artnet_en = {g.get('artnet_en')!r}, "
+        f"rest_locked = {g.get('rest_locked')!r}, login role = {getattr(dev, 'role', None)!r}"
+    )
     try:
         cur = dev.get("/artnet/config")
     except NotFound:
         sys.exit("  no /artnet/config on this firmware")
     print(f"  GET artnet/config -> {json.dumps(cur)}")
+    if explore:
+        # Can this login write any setting at all? Writing the current name back changes nothing.
+        for path in ("/device/config", "/device/name", "/summary"):
+            try:
+                print(f"  GET {path.lstrip('/')} -> {json.dumps(dev.get(path))[:400]}")
+            except (NotFound, RuntimeError) as e:
+                print(f"  GET {path.lstrip('/')} -> {e}")
+        try:
+            name = dev.get("/device/name").get("name")
+            if name:
+                reply = dev.post("/device/name", {"name": name})
+                print(
+                    f"  POST device/name {json.dumps({'name': name})} (same name: a no-op write) -> {json.dumps(reply)}"
+                )
+        except (NotFound, RuntimeError) as e:
+            print(f"  POST device/name (same name) -> {e}")
     if switch is None:
         return
     want = switch == "on"
@@ -671,6 +693,46 @@ def run_artnet(dev, switch, explore=False):
             ("POST", "/device/config", {"artnet_en": want}),
             ("POST", "/artnet/en", {"enable": want}),
             ("POST", "/artnet/enabled", {"enabled": want}),
+            ("POST", "/artnet/config", {"mode": "enabled" if want else "disabled"}),
+            ("POST", "/artnet/config", {**settings, "mode": "enabled" if want else "disabled"}),
+            ("POST", "/artnet/config", {"enable": "enabled" if want else "disabled"}),
+            ("POST", "/artnet/config", {**settings, "enable": want, "result": {"code": 1000}}),
+            ("POST", "/artnet/config", {"en": want}),
+            ("POST", "/artnet/config", {"enable": want, "protocol": "artnet"}),
+            ("POST", "/artnet/config", {**settings, "enable": want, "protocol": "artnet"}),
+            (
+                "POST",
+                "/artnet/config",
+                {"enable": want, "model": settings.get("model", 0), "port_address": 0, "dmx_address": 1},
+            ),
+            (
+                "POST",
+                "/artnet/config",
+                {"enable": want, "model": 1, "port_address": settings.get("port_address", 0), "dmx_address": 1},
+            ),
+            ("POST", "/artnet/config", [{**settings, "enable": want}]),
+            (
+                "POST",
+                "/artnet/config",
+                {
+                    "enable": want,
+                    "model": settings.get("model", 0),
+                    "universe": settings.get("port_address", 0),
+                    "dmx_address": 1,
+                },
+            ),
+            (
+                "POST",
+                "/artnet/config",
+                {
+                    "enable": want,
+                    "model": settings.get("model", 0),
+                    "net": 1,
+                    "subnet": 0,
+                    "universe": 0,
+                    "dmx_address": 1,
+                },
+            ),
         ]
     seen = set()
     for method, path, body in attempts:
