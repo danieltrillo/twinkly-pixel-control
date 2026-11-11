@@ -87,6 +87,7 @@ EOF
   echo "  config:  $CONFIG_DIR/config.yaml   (twinkly-bridge check -c $CONFIG_DIR/config.yaml)"
   echo "  logs:    journalctl -u twinkly-bridge -f"
   echo "  status:  http://<this-host>:$PORT"
+  echo "  setup:   http://<this-host>:$PORT/setup   (add controllers, edit the config from a phone)"
   echo "  mapping: http://<this-host>:$PORT/map   (clips + results in /var/lib/twinkly-bridge/mapping)"
   echo "  this host's addresses:"
   ip -4 -brief addr | grep -v "^lo" | sed "s/^/    /"

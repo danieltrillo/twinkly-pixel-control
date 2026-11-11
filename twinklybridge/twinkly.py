@@ -20,6 +20,7 @@ import base64
 import os
 import socket
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -321,6 +322,28 @@ class TwinklyClient:
         if result_code(reply) != CODE_OK:
             raise TwinklyError(f"set mode {mode!r} refused: {reply}")
 
+    async def artnet_config(self) -> dict:
+        """The built-in Art-Net mode's settings on Pro firmware: enable, model, port_address, dmx_address.
+
+        Consumer firmware has no such endpoint (NotFound)."""
+        reply = await self._request("GET", "/artnet/config")
+        return {k: v for k, v in reply.items() if k not in ("code", "result")}
+
+    async def set_artnet(self, enable: bool) -> dict:
+        """Switch the built-in Art-Net mode on or off, keeping its other settings; returns the new settings.
+
+        The bridge needs it off: a controller in Art-Net mode fights the realtime stream."""
+        current = await self.artnet_config()
+        body = {**current, "enable": bool(enable)}
+        reply = await self._request("POST", "/artnet/config", body)
+        if result_code(reply) != CODE_OK:
+            raise TwinklyError(f"artnet/config refused: {reply}")
+        after = await self.artnet_config()
+        if bool(after.get("enable")) != bool(enable):
+            state = "on" if after.get("enable") else "off"
+            raise TwinklyError(f"the controller accepted the change but still reports built-in Art-Net {state}")
+        return after
+
     async def led_config(self) -> list[dict]:
         try:
             reply = await self._request("GET", "/led/config")
@@ -341,6 +364,7 @@ DISCOVERY_REQUEST = b"\x01discover"
 class Discovered:
     ip: str
     name: str
+    http_port: int = HTTP_PORT
 
 
 def parse_discovery_reply(data: bytes, sender_ip: str) -> Discovered | None:
@@ -357,8 +381,11 @@ def parse_discovery_reply(data: bytes, sender_ip: str) -> Discovered | None:
     return Discovered(ip=ip, name=name)
 
 
-def discover(broadcast: str = "255.255.255.255", timeout: float = 2.0, bind_ip: str = "") -> list[Discovered]:
-    """Broadcast a discovery request and collect replies (blocking)."""
+def discover(
+    broadcast: str | Sequence[str] = "255.255.255.255", timeout: float = 2.0, bind_ip: str = ""
+) -> list[Discovered]:
+    """Broadcast a discovery request (to one or more addresses) and collect replies (blocking)."""
+    targets = [broadcast] if isinstance(broadcast, str) else list(dict.fromkeys(broadcast))
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
     sock.bind((bind_ip, 0))
@@ -369,7 +396,11 @@ def discover(broadcast: str = "255.255.255.255", timeout: float = 2.0, bind_ip: 
         next_send = 0.0
         while time.monotonic() < deadline:
             if time.monotonic() >= next_send:
-                sock.sendto(DISCOVERY_REQUEST, (broadcast, DISCOVERY_PORT))
+                for target in targets:
+                    try:
+                        sock.sendto(DISCOVERY_REQUEST, (target, DISCOVERY_PORT))
+                    except OSError:
+                        continue  # no route to that subnet; the others may still answer
                 next_send = time.monotonic() + 0.5
             try:
                 data, addr = sock.recvfrom(512)
@@ -385,6 +416,38 @@ def discover(broadcast: str = "255.255.255.255", timeout: float = 2.0, bind_ip: 
     return sorted(found.values(), key=lambda d: socket.inet_aton(d.ip))
 
 
+def local_networks() -> list[dict]:
+    """This box's IPv4 interfaces: [{"name", "ip", "broadcast"}], without loopback (Linux)."""
+    out: list[dict] = []
+    try:
+        import fcntl
+        import struct
+    except ImportError:
+        return out
+    try:
+        names = sorted(os.listdir("/sys/class/net"))  # no netlink needed (systemd sandboxes block it)
+    except OSError:
+        try:
+            names = [name for _, name in socket.if_nameindex()]
+        except (OSError, AttributeError):
+            return out
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        for name in names:
+            packed = struct.pack("256s", name.encode()[:15])
+            try:
+                ip = socket.inet_ntoa(fcntl.ioctl(sock.fileno(), 0x8915, packed)[20:24])  # SIOCGIFADDR
+                bcast = socket.inet_ntoa(fcntl.ioctl(sock.fileno(), 0x8919, packed)[20:24])  # SIOCGIFBRDADDR
+            except OSError:
+                continue
+            if ip.startswith("127.") or bcast in ("0.0.0.0", ip):
+                continue
+            out.append({"name": name, "ip": ip, "broadcast": bcast})
+    finally:
+        sock.close()
+    return out
+
+
 __all__ = [
     "AuthError",
     "DeviceInfo",
@@ -394,6 +457,7 @@ __all__ = [
     "build_packets",
     "default_order",
     "discover",
+    "local_networks",
     "parse_discovery_reply",
     "protocol_for_firmware",
 ]

@@ -16,6 +16,7 @@ Usage:
   python3 twinkly_probe.py chunks <controller-ip> [--hold 8]     # which output is which
   python3 twinkly_probe.py scan  <controller-ip> [--slot 0.4] [--brightness 96] [--repeat 2]
                                                   # blink code for camera mapping (tools/pixelmap.py)
+  python3 twinkly_probe.py artnet <controller-ip> [--off | --on]   # the built-in Art-Net mode (Pro)
 
 Reference: https://xled-docs.readthedocs.io/en/latest/protocol_details.html
 """
@@ -115,6 +116,8 @@ class Twinkly:
     def fw_path(self):
         return "/fw/ct1/version" if self.api == "v2" else "/fw/version"
 
+    role = None
+
     def login(self):
         self.detect()
         challenge = base64.b64encode(os.urandom(32)).decode()
@@ -123,6 +126,7 @@ class Twinkly:
             raise RuntimeError(f"login failed: {r}")
         self.token = r["authentication_token"]
         self.token_raw = base64.b64decode(self.token)
+        self.role = r.get("auth-role")  # Pro firmware 4.x says "user"
         v = self.post("/verify", {"challenge-response": r.get("challenge-response", "")})
         if code(v) != 1000:
             raise RuntimeError(f"verify failed: {v}")
@@ -621,10 +625,145 @@ def run_scan(dev, fps, order, proto_override, slot, brightness, color, repeat, c
             print(f"\n  couldn't restore mode ({e}) - pick a movie in the app")
 
 
+# ------------------------------------------------------------------- artnet --
+def run_artnet(dev, switch, explore=False):
+    """Show the built-in Art-Net setting; with --off/--on try the requests the firmware may take.
+
+    Every request only ever carries the current settings with "enable" changed, so a
+    rejected one changes nothing. --explore also probes nearby routes and methods."""
+    g = dev.detect()
+    dev.login()
+    print(
+        f"  {g.get('device_name', '?')} ({dev.api}), gestalt artnet_en = {g.get('artnet_en')!r}, "
+        f"rest_locked = {g.get('rest_locked')!r}, login role = {getattr(dev, 'role', None)!r}"
+    )
+    try:
+        cur = dev.get("/artnet/config")
+    except NotFound:
+        sys.exit("  no /artnet/config on this firmware")
+    print(f"  GET artnet/config -> {json.dumps(cur)}")
+    if explore:
+        # Can this login write any setting at all? Writing the current name back changes nothing.
+        for path in ("/device/config", "/device/name", "/summary"):
+            try:
+                print(f"  GET {path.lstrip('/')} -> {json.dumps(dev.get(path))[:400]}")
+            except (NotFound, RuntimeError) as e:
+                print(f"  GET {path.lstrip('/')} -> {e}")
+        try:
+            name = dev.get("/device/name").get("name")
+            if name:
+                reply = dev.post("/device/name", {"name": name})
+                print(
+                    f"  POST device/name {json.dumps({'name': name})} (same name: a no-op write) -> {json.dumps(reply)}"
+                )
+        except (NotFound, RuntimeError) as e:
+            print(f"  POST device/name (same name) -> {e}")
+    if switch is None:
+        return
+    want = switch == "on"
+    settings = {k: v for k, v in cur.items() if k not in ("code", "result")}
+    attempts = [
+        ("POST", "/artnet/config", {"enable": want}),
+        ("POST", "/artnet/config", {"enable": int(want)}),
+        ("POST", "/artnet/config", {**settings, "enable": want}),
+        ("POST", "/artnet/config", {**settings, "enable": int(want)}),
+    ]
+    if explore:
+        word = "on" if want else "off"
+        attempts += [
+            ("POST", "/artnet/config", {"enable": word}),
+            ("POST", "/artnet/config", {"enable": str(want).lower()}),
+            ("POST", "/artnet/config", {"mode": word}),
+            ("POST", "/artnet/config", {"artnet": {**settings, "enable": want}}),
+            ("POST", "/artnet/config", {"config": {**settings, "enable": want}}),
+            ("POST", "/artnet/config", {"enable": want, "model": str(settings.get("model", 0))}),
+            ("PUT", "/artnet/config", {"enable": want}),
+            ("PUT", "/artnet/config", {**settings, "enable": want}),
+            ("PATCH", "/artnet/config", {"enable": want}),
+            ("POST", "/artnet/enable", {"enable": want}),
+            ("POST", "/artnet/enable", {"value": want}),
+            ("POST", "/artnet", {"enable": want}),
+            ("POST", "/artnet", {**settings, "enable": want}),
+            ("POST", "/artnet/config/enable", {"enable": want}),
+            ("POST", "/artnet/mode", {"mode": word}),
+            ("POST", "/artnet/mode", {"enable": want}),
+            ("POST", "/dmx/config", {**settings, "enable": want}),
+            ("POST", "/dmx/config", {"enable": want}),
+            ("POST", "/dmx", {"enable": want}),
+            ("POST", "/device/config", {"artnet_en": want}),
+            ("POST", "/artnet/en", {"enable": want}),
+            ("POST", "/artnet/enabled", {"enabled": want}),
+            ("POST", "/artnet/config", {"mode": "enabled" if want else "disabled"}),
+            ("POST", "/artnet/config", {**settings, "mode": "enabled" if want else "disabled"}),
+            ("POST", "/artnet/config", {"enable": "enabled" if want else "disabled"}),
+            ("POST", "/artnet/config", {**settings, "enable": want, "result": {"code": 1000}}),
+            ("POST", "/artnet/config", {"en": want}),
+            ("POST", "/artnet/config", {"enable": want, "protocol": "artnet"}),
+            ("POST", "/artnet/config", {**settings, "enable": want, "protocol": "artnet"}),
+            (
+                "POST",
+                "/artnet/config",
+                {"enable": want, "model": settings.get("model", 0), "port_address": 0, "dmx_address": 1},
+            ),
+            (
+                "POST",
+                "/artnet/config",
+                {"enable": want, "model": 1, "port_address": settings.get("port_address", 0), "dmx_address": 1},
+            ),
+            ("POST", "/artnet/config", [{**settings, "enable": want}]),
+            (
+                "POST",
+                "/artnet/config",
+                {
+                    "enable": want,
+                    "model": settings.get("model", 0),
+                    "universe": settings.get("port_address", 0),
+                    "dmx_address": 1,
+                },
+            ),
+            (
+                "POST",
+                "/artnet/config",
+                {
+                    "enable": want,
+                    "model": settings.get("model", 0),
+                    "net": 1,
+                    "subnet": 0,
+                    "universe": 0,
+                    "dmx_address": 1,
+                },
+            ),
+        ]
+    seen = set()
+    for method, path, body in attempts:
+        key = (method, path, json.dumps(body, sort_keys=True))
+        if key in seen:
+            continue
+        seen.add(key)
+        label = f"{method} {path.lstrip('/')} {json.dumps(body)}"
+        try:
+            reply = dev._req(method, path, body)
+        except NotFound:
+            print(f"  {label} -> 404 (no such route)")
+            continue
+        except RuntimeError as e:
+            print(f"  {label} -> {str(e).split('->', 1)[-1].strip()}")
+            continue
+        print(f"  {label} -> {json.dumps(reply)}")
+        after = dev.get("/artnet/config")
+        g2 = dev.get("/gestalt", auth=False)
+        print(f"     now: artnet/config {json.dumps(after)}; gestalt artnet_en = {g2.get('artnet_en')!r}")
+        if bool(after.get("enable")) == want and bool(g2.get("artnet_en")) == want:
+            print(f"  OK: built-in Art-Net is now {'on' if want else 'off'} (request that worked: {label})")
+            return
+        print("     accepted, but the setting did not change; trying the next one")
+    sys.exit("  nothing worked; see the replies above")
+
+
 # --------------------------------------------------------------------- main --
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("command", choices=["info", "test", "locate", "chunks", "scan"])
+    ap.add_argument("command", choices=["info", "test", "locate", "chunks", "scan", "artnet"])
     ap.add_argument("ip")
     ap.add_argument("--fps", type=float, default=40, help="frames per second to send (default 40)")
     ap.add_argument(
@@ -656,6 +795,9 @@ def main():
     )
     ap.add_argument("--repeat", type=int, default=2, help="scan: passes back to back (default 2)")
     ap.add_argument("--countdown", type=int, default=5, help="scan: black seconds before the first pass (default 5)")
+    ap.add_argument("--off", action="store_true", help="artnet: switch the built-in Art-Net mode off")
+    ap.add_argument("--on", action="store_true", help="artnet: switch it on")
+    ap.add_argument("--explore", action="store_true", help="artnet: also try nearby routes, methods and body shapes")
     a = ap.parse_args()
 
     dev = Twinkly(a.ip, a.http_port, a.udp_port)
@@ -668,6 +810,8 @@ def main():
             run_scan(dev, a.fps, a.order, a.proto, a.slot, a.brightness, a.color, a.repeat, a.countdown)
         elif a.command == "chunks":
             run_chunks(dev, a.fps, a.order, a.proto, a.hold)
+        elif a.command == "artnet":
+            run_artnet(dev, "off" if a.off else "on" if a.on else None, a.explore)
         else:
             run_test(dev, a.fps, a.order, a.proto, a.yes, a.hold)
     except RuntimeError as e:

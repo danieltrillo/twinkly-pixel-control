@@ -558,9 +558,7 @@ class Engine:
         self.sender: Sender = sender or UdpSender()
         self.devices = [DeviceRunner(cfg=d, sender=self.sender) for d in config.enabled_devices]
         self._map: dict[tuple[str, int], list[tuple[DeviceRunner, Segment]]] = {}
-        for dev in self.devices:
-            for seg in dev.cfg.segments:
-                self._map.setdefault((dev.cfg.protocol, seg.universe), []).append((dev, seg))
+        self._rebuild_map()
         self.ip = config.input.ip if config.input.ip != "0.0.0.0" else guess_local_ip()
         self.last_rx: dict[tuple[str, int], float] = {}
         self.unmapped: dict[tuple[str, int], tuple[str, float]] = {}
@@ -630,6 +628,58 @@ class Engine:
         if self._own_sender and isinstance(self.sender, UdpSender):
             self.sender.close()
         log.info("bridge stopped")
+
+    def _rebuild_map(self) -> None:
+        self._map = {}
+        for dev in self.devices:
+            for seg in dev.cfg.segments:
+                self._map.setdefault((dev.cfg.protocol, seg.universe), []).append((dev, seg))
+
+    async def apply_config(self, config: Config) -> None:
+        """Update to a new config in place, touching only the controllers that changed.
+
+        Controllers whose config is unchanged keep their connection, login and
+        stream; only added, removed and changed ones are started or stopped, and
+        the listen sockets stay open. The caller must use this only while
+        config.input is unchanged (same sockets, same protocols); otherwise it
+        restarts the whole engine.
+        """
+        old = {d.cfg.name: d for d in self.devices}
+        wanted = {c.name: c for c in config.enabled_devices}
+        kept: dict[str, DeviceRunner] = {}
+        to_stop: list[DeviceRunner] = []
+        for name, runner in old.items():
+            new_cfg = wanted.get(name)
+            if new_cfg is not None and new_cfg == runner.cfg:
+                kept[name] = runner
+            else:
+                to_stop.append(runner)  # removed, disabled, or its settings changed
+        started: list[DeviceRunner] = []
+        new_devices: list[DeviceRunner] = []
+        for c in config.enabled_devices:
+            runner = kept.get(c.name)
+            if runner is None:
+                runner = DeviceRunner(cfg=c, sender=self.sender)
+                runner.session = self._session
+                started.append(runner)
+            new_devices.append(runner)
+        # Swap the device set and map in one synchronous step, so feed() never
+        # sees a half-built map, then release the old controllers and start the new.
+        self.devices = new_devices
+        self._rebuild_map()
+        self.config = config
+        await asyncio.gather(*(r.stop(release=True) for r in to_stop), return_exceptions=True)
+        for runner in started:
+            runner.start()
+        self.announce()
+        log.info(
+            "config applied in place: %d device(s), %d universe(s) (%d started, %d stopped, %d kept streaming)",
+            len(new_devices),
+            len(self._map),
+            len(started),
+            len(to_stop),
+            len(kept),
+        )
 
     def _join_sacn_groups(self, sock: socket.socket) -> None:
         local = self.config.input.ip if self.config.input.ip != "0.0.0.0" else "0.0.0.0"

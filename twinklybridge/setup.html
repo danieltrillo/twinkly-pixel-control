@@ -1,0 +1,521 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Setup · Twinkly Bridge</title>
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --text:#1c1e21; --muted:#6b7280; --line:#e5e7eb;
+          --ok:#15803d; --warn:#b45309; --bad:#b91c1c; --accent:#2563eb; --accent-text:#fff; --idle:#9aa0a6; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#111317; --card:#1a1d23; --text:#e8eaed; --muted:#9aa0a6; --line:#2a2e36;
+            --ok:#4ade80; --warn:#fbbf24; --bad:#f87171; --accent:#3b82f6; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:16px/1.45 system-ui, -apple-system, Segoe UI, sans-serif; }
+  header { display:flex; flex-wrap:wrap; gap:12px; align-items:baseline; padding:14px 16px 4px; }
+  h1 { font-size:18px; margin:0; }
+  header a { color:var(--muted); font-size:14px; }
+  main { padding:8px 16px 40px; display:grid; gap:14px; max-width:720px; margin:0 auto; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:14px; }
+  .card h2 { font-size:15px; margin:0 0 8px; }
+  .muted { color:var(--muted); } .small { font-size:13px; }
+  .ok { color:var(--ok); } .warn { color:var(--warn); } .bad { color:var(--bad); }
+  .row { display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fill, minmax(150px, 1fr)); gap:10px; margin-top:8px; }
+  label.f { display:flex; flex-direction:column; gap:3px; font-size:13px; color:var(--muted); min-width:0; }
+  label.f.wide { grid-column: 1 / -1; }
+  label.c { display:flex; gap:8px; align-items:center; font-size:14px; color:var(--text); }
+  input[type=text], input[type=number], select, textarea { font:inherit; padding:8px 10px; border-radius:8px; border:1px solid var(--line); background:var(--bg); color:var(--text); width:100%; }
+  input[type=checkbox] { width:20px; height:20px; }
+  textarea { font:13px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; min-height:320px; white-space:pre; }
+  button { font:inherit; padding:10px 14px; border-radius:10px; border:1px solid var(--line); background:var(--card); color:var(--text); cursor:pointer; }
+  button.primary { background:var(--accent); color:var(--accent-text); border-color:var(--accent); font-weight:600; }
+  button.big { font-size:17px; padding:14px 18px; flex:1; min-width:150px; }
+  button.sm { padding:6px 10px; font-size:13px; }
+  button.danger { color:var(--bad); }
+  button:disabled { opacity:.45; cursor:default; }
+  .dev { display:flex; gap:10px; padding:10px 0; border-top:1px solid var(--line); align-items:flex-start; }
+  .dev .body { flex:1; min-width:0; } .dev .body div { overflow-wrap:anywhere; }
+  .dev .btns { display:flex; flex-direction:column; gap:6px; flex:none; }
+  .dev.off { opacity:.6; }
+  .dot { display:inline-block; width:9px; height:9px; border-radius:50%; margin-right:6px; background:var(--idle); vertical-align:middle; }
+  .dot.ok { background:var(--ok); } .dot.warn { background:var(--warn); } .dot.bad { background:var(--bad); }
+  .found { display:flex; gap:10px; padding:8px 0; border-top:1px solid var(--line); align-items:flex-start; }
+  .found .body { flex:1; min-width:0; }
+  .banner { background:var(--bad); color:#fff; padding:10px 12px; border-radius:10px; margin-bottom:8px; overflow-wrap:anywhere; }
+  .banner.warn { background:var(--warn); }
+  .msg { margin-top:8px; font-size:14px; min-height:1.2em; overflow-wrap:anywhere; }
+  details summary { cursor:pointer; font-size:15px; font-weight:600; }
+  .hint { font-size:13px; color:var(--muted); margin-top:4px; }
+  code { font-size:13px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Setup</h1>
+  <span style="flex:1"></span>
+  <a href="./">status</a>
+  <a href="map">pixel mapping</a>
+</header>
+<main>
+  <div id="banner"></div>
+
+  <section class="card">
+    <h2>Controllers</h2>
+    <div class="row">
+      <button class="primary big" id="find">Find controllers</button>
+      <button class="big" id="addmanual">Add by hand</button>
+    </div>
+    <div class="row" style="margin-top:8px">
+      <input type="text" id="probeip" placeholder="or one IP, e.g. 10.201.82.105" inputmode="decimal" style="flex:1; min-width:180px">
+      <button id="probe">Look up</button>
+    </div>
+    <div id="findstate" class="hint"></div>
+    <div id="found"></div>
+    <div id="devices" style="margin-top:8px"></div>
+    <div id="devmsg" class="msg"></div>
+  </section>
+
+  <section class="card" id="editor" hidden>
+    <h2 id="edtitle">Add a controller</h2>
+    <div id="edform">
+    <div class="grid">
+      <label class="f">name <input type="text" data-k="name" placeholder="Tree 1"></label>
+      <label class="f">IP address <input type="text" data-k="ip" placeholder="10.201.82.105" inputmode="decimal"></label>
+      <label class="f">first universe <input type="text" data-k="universe" placeholder="next free"></label>
+      <label class="f">pixels <input type="number" data-k="pixels" min="1" max="20000" inputmode="numeric"></label>
+      <label class="f">protocol <select data-k="protocol"><option value="">(default)</option><option value="artnet">Art-Net</option><option value="sacn">sACN</option></select></label>
+      <label class="c" style="align-self:end"><input type="checkbox" data-k="enabled" checked> enabled</label>
+    </div>
+    <div class="hint" id="edspan"></div>
+    <details style="margin-top:10px"><summary style="font-size:14px; font-weight:normal; color:var(--muted)">More settings (blank = use the defaults below)</summary>
+      <div class="grid">
+        <label class="f">console pixel layout <input type="text" data-k="input" placeholder="RGBW" list="layouts"></label>
+        <label class="f">wire order to the Twinkly <input type="text" data-k="order" placeholder="auto" list="orders"></label>
+        <label class="f">fps <input type="number" data-k="fps" min="1" max="60" step="0.5"></label>
+        <label class="f">when input stops <select data-k="on_loss"><option value="">(default)</option><option value="hold">hold the last look</option><option value="black">go black</option><option value="release">release to the app's effect</option></select></label>
+        <label class="f">loss timeout (s) <input type="number" data-k="loss_timeout" min="0.5" max="3600" step="0.5"></label>
+        <label class="f">start channel <input type="number" data-k="start_channel" min="1" max="512"></label>
+        <label class="f">pixels per universe <input type="number" data-k="pixels_per_universe" min="0" max="170" placeholder="as many as fit"></label>
+      </div>
+    </details>
+    </div>
+    <datalist id="layouts"><option>RGBW</option><option>RGB</option><option>GRBW</option><option>GRB</option><option>BGR</option><option>WRGB</option></datalist>
+    <datalist id="orders"><option>auto</option><option>WRGB</option><option>RGBW</option><option>GRBW</option><option>RGB</option><option>GRB</option></datalist>
+    <div class="row" style="margin-top:12px">
+      <button class="primary big" id="edsave">Save</button>
+      <button class="big" id="edcancel">Cancel</button>
+    </div>
+    <div id="edmsg" class="msg"></div>
+  </section>
+
+  <section class="card">
+    <h2>Console input</h2>
+    <div class="grid" id="inputform">
+      <label class="f wide">this box's IP on the Art-Net / sACN network, with prefix <input type="text" data-k="cidr" placeholder="10.201.82.104/24" inputmode="decimal"></label>
+      <label class="c"><input type="checkbox" data-k="artnet"> Art-Net</label>
+      <label class="c"><input type="checkbox" data-k="sacn"> sACN</label>
+      <label class="f">ArtPollReply <select data-k="reply"><option value="">(default: broadcast)</option><option value="broadcast">broadcast</option><option value="unicast">unicast</option></select></label>
+      <label class="f">node name (max 17) <input type="text" data-k="short_name" placeholder="TwinklyBridge" maxlength="17"></label>
+    </div>
+    <div class="hint" id="inputhint"></div>
+    <div class="row" style="margin-top:10px"><button class="primary" id="inputsave">Save input</button></div>
+    <div id="inputmsg" class="msg"></div>
+  </section>
+
+  <section class="card">
+    <h2>Defaults for every controller</h2>
+    <div class="grid" id="defform">
+      <label class="f">console pixel layout <input type="text" data-k="input" placeholder="RGBW" list="layouts"></label>
+      <label class="f">wire order to the Twinkly <input type="text" data-k="order" placeholder="auto" list="orders"></label>
+      <label class="f">fps <input type="number" data-k="fps" min="1" max="60" step="0.5" placeholder="25"></label>
+      <label class="f">when input stops <select data-k="on_loss"><option value="">hold the last look</option><option value="hold">hold the last look</option><option value="black">go black</option><option value="release">release to the app's effect</option></select></label>
+      <label class="f">loss timeout (s) <input type="number" data-k="loss_timeout" min="0.5" max="3600" step="0.5" placeholder="5"></label>
+      <label class="f">protocol <select data-k="protocol"><option value="">Art-Net if on, else sACN</option><option value="artnet">Art-Net</option><option value="sacn">sACN</option></select></label>
+    </div>
+    <div class="row" style="margin-top:10px"><button class="primary" id="defsave">Save defaults</button></div>
+    <div id="defmsg" class="msg"></div>
+  </section>
+
+  <section class="card">
+    <details id="mapdetails"><summary>Camera mapping settings</summary>
+      <div class="grid" id="mapform">
+        <label class="f">seconds per code slot <input type="number" data-k="slot" min="0.1" max="2" step="0.1" placeholder="0.4"></label>
+        <label class="f">brightness (1-255) <input type="number" data-k="brightness" min="1" max="255" placeholder="96"></label>
+        <label class="f">colour <select data-k="color"><option value="">white</option><option value="white">white</option><option value="rgb">rgb</option><option value="green">green</option></select></label>
+        <label class="f">passes per scan <input type="number" data-k="passes" min="1" max="100" placeholder="10"></label>
+        <label class="f">refuse uploads under (MB free) <input type="number" data-k="min_free_mb" min="0" placeholder="500"></label>
+        <label class="f">max upload (MB) <input type="number" data-k="max_upload_mb" min="1" placeholder="4000"></label>
+        <label class="c"><input type="checkbox" data-k="keep_clips"> keep clips after a good decode</label>
+      </div>
+      <div class="row" style="margin-top:10px"><button class="primary" id="mapsave">Save mapping settings</button></div>
+      <div id="mapmsg" class="msg"></div>
+    </details>
+  </section>
+
+  <section class="card">
+    <details id="webdetails"><summary>Web page and log</summary>
+      <div class="grid" id="webform">
+        <label class="f">bind address <input type="text" data-k="bind" placeholder="0.0.0.0"></label>
+        <label class="f">port <input type="number" data-k="port" min="1" max="65535" placeholder="8080"></label>
+        <label class="f">log level <select id="loglevel"><option>info</option><option>debug</option><option>warning</option><option>error</option></select></label>
+      </div>
+      <div class="hint">A new bind address or port takes effect after <code>systemctl restart twinkly-bridge</code>.</div>
+      <div class="row" style="margin-top:10px"><button class="primary" id="websave">Save</button></div>
+      <div id="webmsg" class="msg"></div>
+    </details>
+  </section>
+
+  <section class="card">
+    <details id="yamldetails"><summary>Config file</summary>
+      <div class="hint" id="yamlpath"></div>
+      <textarea id="yaml" spellcheck="false"></textarea>
+      <div class="row" style="margin-top:10px">
+        <button class="primary" id="yamlsave">Save file</button>
+        <button id="yamlreload">Reload text</button>
+      </div>
+      <div class="hint">Saving from the forms above rewrites this file in a standard layout (comments go). Every save keeps the previous version next to it as <code>config.yaml.&lt;time&gt;.bak</code> and restarts the bridge's streams for about a second.</div>
+      <div id="yamlmsg" class="msg"></div>
+    </details>
+  </section>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+let state = null;
+let editing = null;   // name of the device being edited, or null when adding
+let found = [];       // last discovery result
+
+async function api(method, url, body) {
+  const opts = { method, headers: {} };
+  if (body !== undefined) { opts.headers["Content-Type"] = "application/json"; opts.body = JSON.stringify(body); }
+  let r;
+  try { r = await fetch(url, opts); } catch (e) { throw new Error("lost contact with the bridge"); }
+  let j = null;
+  try { j = await r.json(); } catch (e) { throw new Error(`HTTP ${r.status}`); }
+  if (!r.ok || j.ok === false) throw new Error(j.error || `HTTP ${r.status}`);
+  return j;
+}
+function say(id, text, cls) { const el = $(id); el.textContent = text; el.className = "msg " + (cls || ""); }
+function collect(container) {
+  const out = {};
+  container.querySelectorAll("[data-k]").forEach((el) => {
+    const k = el.dataset.k;
+    if (el.type === "checkbox") out[k] = el.checked ? "true" : "false";
+    else out[k] = el.value.trim();
+  });
+  return out;
+}
+function fill(container, obj) {
+  container.querySelectorAll("[data-k]").forEach((el) => {
+    const v = obj[el.dataset.k];
+    if (el.type === "checkbox") el.checked = v === undefined ? el.defaultChecked : (v === true || String(v).toLowerCase() === "true");
+    else el.value = v === undefined || v === null ? "" : String(v);
+  });
+}
+function stateCls(s) {
+  if (!s) return "";
+  if (s === "streaming") return "ok";
+  if (s === "offline" || s === "error") return "bad";
+  if (s.startsWith("no input") || s === "connecting" || s === "starting") return "warn";
+  return "";
+}
+// Art-Net universes as net.subnet.universe
+function parseU(text, protocol) {
+  text = String(text ?? "").trim();
+  if (!text) return null;
+  if (protocol === "sacn") return /^\d+$/.test(text) ? parseInt(text, 10) : null;
+  const parts = text.split(".");
+  if (parts.length === 3 && parts.every((p) => /^\d+$/.test(p))) {
+    const [n, s, u] = parts.map(Number);
+    if (n > 127 || s > 15 || u > 15) return null;
+    return (n << 8) | (s << 4) | u;
+  }
+  return /^\d+$/.test(text) ? parseInt(text, 10) : null;
+}
+function fmtU(pa, protocol) { return protocol === "sacn" ? String(pa) : `${pa >> 8}.${(pa >> 4) & 15}.${pa & 15}`; }
+function spanOf(spec) {
+  const d = state ? state.defaults : {};
+  const layout = spec.input || d.input || "RGBW";
+  const ch = Math.max(1, layout.length);
+  const per = parseInt(spec.pixels_per_universe || d.pixels_per_universe || 0, 10) || Math.floor(512 / ch);
+  const start = parseInt(spec.start_channel || d.start_channel || 1, 10);
+  const pixels = parseInt(spec.pixels || 1, 10);
+  const firstFit = Math.max(1, Math.min(per, Math.floor((512 - (start - 1)) / ch)));
+  return pixels <= firstFit ? 1 : 1 + Math.ceil((pixels - firstFit) / per);
+}
+function protocolOf(spec) {
+  if (spec.protocol) return spec.protocol;
+  const d = state ? state.defaults : {};
+  if (d.protocol) return d.protocol;
+  const inp = state ? state.input : {};
+  const artnet = inp.artnet === undefined ? true : (inp.artnet === true || String(inp.artnet).toLowerCase() === "true");
+  return artnet ? "artnet" : "sacn";
+}
+
+// ---- controllers list ----
+function renderDevices() {
+  const running = state.running || {};
+  const html = state.devices.map((entry) => {
+    const spec = entry.spec, d = entry.derived;
+    const name = spec.name || (d && d.name) || "?";
+    const run = running[name] || {};
+    const st = run.state || "";
+    const enabled = d ? d.enabled : spec.enabled !== false;
+    const artnet = run.artnet === true
+      ? `<div class="small warn">built-in Art-Net is on: it fights the bridge <button class="sm" data-artnet="${esc(spec.ip)}">Turn it off</button></div>`
+      : "";
+    const line2 = d
+      ? `${esc(d.protocol)} ${esc(d.universes)} · ${d.universe_count} univ · ${d.pixels} px · ${esc(d.input)}→${esc(d.order)} @ ${d.fps} fps`
+      : `${esc(spec.universe ?? "?")} · ${esc(spec.pixels ?? "?")} px`;
+    return `<div class="dev ${enabled ? "" : "off"}">
+      <div class="body">
+        <div><span class="dot ${stateCls(st)}"></span><b>${esc(name)}</b> <span class="muted small">${esc(spec.ip)}</span> <span class="small ${stateCls(st)}">${esc(st || (enabled ? "" : "disabled"))}</span></div>
+        <div class="small muted">${line2}</div>
+        ${artnet}
+      </div>
+      <div class="btns">
+        <button class="sm" data-edit="${esc(name)}">Edit</button>
+        <button class="sm" data-toggle="${esc(name)}" data-on="${enabled ? 1 : 0}">${enabled ? "Disable" : "Enable"}</button>
+        <button class="sm danger" data-del="${esc(name)}">Delete</button>
+      </div></div>`;
+  }).join("");
+  $("devices").innerHTML = html || `<div class="muted small">No controllers yet. Tap <b>Find controllers</b>.</div>`;
+  $("devices").querySelectorAll("[data-edit]").forEach((b) => b.onclick = () => {
+    const entry = state.devices.find((e) => (e.spec.name || (e.derived && e.derived.name)) === b.dataset.edit);
+    openEditor(entry.spec, b.dataset.edit);
+  });
+  $("devices").querySelectorAll("[data-toggle]").forEach((b) => b.onclick = async () => {
+    try {
+      say("devmsg", "saving…");
+      const r = await api("PATCH", `api/setup/devices/${encodeURIComponent(b.dataset.toggle)}`, { enabled: b.dataset.on === "1" ? "false" : "true" });
+      applyResult(r, "devmsg");
+    } catch (e) { say("devmsg", e.message, "bad"); }
+  });
+  $("devices").querySelectorAll("[data-artnet]").forEach((b) => b.onclick = () => artnetOff([b.dataset.artnet], "devmsg"));
+  $("devices").querySelectorAll("[data-del]").forEach((b) => b.onclick = async () => {
+    if (!confirm(`Delete ${b.dataset.del} from the config?`)) return;
+    try {
+      say("devmsg", "saving…");
+      const r = await api("DELETE", `api/setup/devices/${encodeURIComponent(b.dataset.del)}`);
+      applyResult(r, "devmsg");
+    } catch (e) { say("devmsg", e.message, "bad"); }
+  });
+}
+function applyResult(r, msgId) {
+  state = r.state;
+  renderAll(false);
+  const extra = r.reload_error ? ` · bridge says: ${r.reload_error}` : "";
+  say(msgId, `saved${r.backup ? ` (previous copy: ${r.backup})` : ""}${extra}`, r.reload_error ? "warn" : "ok");
+}
+
+// ---- the controller's built-in Art-Net mode (a persistent change on the controller) ----
+async function artnetOff(ips, msgId) {
+  if (!confirm(`Turn off built-in Art-Net on ${ips.length === 1 ? ips[0] : ips.length + " controllers"}? This is saved on the controller itself (the Twinkly Pro app shows it under DMX/Art-Net).`)) return;
+  let done = 0;
+  for (const ip of ips) {
+    try {
+      say(msgId, `switching ${ip}…`);
+      await api("POST", "api/setup/artnet", { ip, enable: false });
+      done++;
+      found.forEach((f) => { if (f.ip === ip && f.info) f.info.artnet_enabled = false; });
+      Object.values(state.running || {}).forEach((r) => { if (r.ip === ip) r.artnet = false; });
+    } catch (e) { say(msgId, `${ip}: ${e.message}`, "bad"); if (ips.length === 1) return; }
+  }
+  say(msgId, `built-in Art-Net off on ${done} of ${ips.length}`, done === ips.length ? "ok" : "warn");
+  renderFound();
+  pollStatus();
+}
+
+// ---- editor ----
+function openEditor(spec, name) {
+  editing = name || null;
+  $("edtitle").textContent = name ? `Edit ${name}` : "Add a controller";
+  fill($("edform"), { enabled: true, ...spec });
+  const d = state.defaults || {};
+  $("edform").querySelector("[data-k=fps]").placeholder = d.fps || 25;
+  $("edform").querySelector("[data-k=loss_timeout]").placeholder = d.loss_timeout || 5;
+  $("edform").querySelector("[data-k=input]").placeholder = d.input || "RGBW";
+  $("edform").querySelector("[data-k=order]").placeholder = d.order || "auto";
+  $("editor").hidden = false;
+  say("edmsg", "");
+  updateSpan();
+  $("editor").scrollIntoView({ behavior: "smooth", block: "start" });
+}
+function updateSpan() {
+  const spec = collect($("edform"));
+  const protocol = protocolOf(spec);
+  const next = state && state.next_universe ? state.next_universe[protocol] : "";
+  const first = spec.universe ? parseU(spec.universe, protocol) : parseU(next, protocol);
+  if (first === null || !spec.pixels) { $("edspan").textContent = spec.universe ? "universe: write it like 0.0.0 (Art-Net) or a number (sACN)" : `next free universe: ${next}`; return; }
+  const n = spanOf(spec);
+  $("edspan").textContent = `${spec.universe ? "" : `next free universe ${fmtU(first, protocol)} · `}${n} universe${n === 1 ? "" : "s"}: ${fmtU(first, protocol)} to ${fmtU(first + n - 1, protocol)}`;
+}
+$("edform").addEventListener("input", updateSpan);
+$("edcancel").onclick = () => { $("editor").hidden = true; editing = null; };
+$("edsave").onclick = async () => {
+  const spec = collect($("edform"));
+  if (spec.enabled === "true") delete spec.enabled;   // the default; keeps the file short
+  try {
+    say("edmsg", "saving…");
+    const r = editing
+      ? await api("PUT", `api/setup/devices/${encodeURIComponent(editing)}`, { device: spec })
+      : await api("POST", "api/setup/devices", { device: spec });
+    $("editor").hidden = true; editing = null;
+    applyResult(r, "devmsg");
+  } catch (e) { say("edmsg", e.message, "bad"); }
+};
+$("addmanual").onclick = () => openEditor({}, null);
+
+// ---- discovery ----
+function renderFound() {
+  if (!found.length) { $("found").innerHTML = ""; return; }
+  const html = found.map((f, i) => {
+    const info = f.info || {};
+    const leds = info.number_of_led ? `${info.number_of_led} ${esc(info.led_profile)}` : "";
+    const notes = [];
+    if (f.error) notes.push(`<span class="bad">${esc(f.error)}</span>`);
+    if (info.group_mode === "slave") notes.push(`<span class="warn">in a group: the bridge can't drive it until you take it out of the group in the Twinkly Pro app</span>`);
+    if (info.artnet_enabled === true) notes.push(`<span class="warn">built-in Art-Net is on; it fights the bridge</span> <button class="sm" data-artnet="${esc(f.ip)}">Turn it off</button>`);
+    const right = f.configured_as
+      ? `<span class="small muted">configured as<br><b>${esc(f.configured_as)}</b></span>`
+      : `<label class="c"><input type="checkbox" data-pick="${i}" ${info.number_of_led ? "checked" : ""}> add</label>`;
+    return `<div class="found">
+      <div class="body">
+        <div><b>${esc(f.name || "Twinkly")}</b> <span class="muted small">${esc(f.ip)}</span></div>
+        <div class="small muted">${esc(info.product_code || "")}${info.firmware ? ` · fw ${esc(info.firmware)}` : ""}${leds ? ` · ${leds}` : ""}${info.max_supported_led ? ` (max ${info.max_supported_led})` : ""}</div>
+        ${notes.length ? `<div class="small">${notes.join("<br>")}</div>` : ""}
+      </div>
+      <div>${right}</div></div>`;
+  }).join("");
+  const addable = found.filter((f) => !f.configured_as && f.info && f.info.number_of_led).length;
+  const artnetOn = found.filter((f) => f.info && f.info.artnet_enabled === true).map((f) => f.ip);
+  $("found").innerHTML = html + `<div class="row" style="margin-top:8px">`
+    + (addable ? `<button class="primary big" id="addpicked">Add selected (universes assigned in order)</button>` : "")
+    + (artnetOn.length > 1 ? `<button class="big" id="artnetall">Turn off built-in Art-Net on all ${artnetOn.length}</button>` : "")
+    + `<button class="big" id="clearfound">Hide</button></div><div id="foundmsg" class="msg"></div>`;
+  if ($("addpicked")) $("addpicked").onclick = addPicked;
+  if ($("artnetall")) $("artnetall").onclick = () => artnetOff(artnetOn, "foundmsg");
+  $("found").querySelectorAll("[data-artnet]").forEach((b) => b.onclick = () => artnetOff([b.dataset.artnet], "foundmsg"));
+  $("clearfound").onclick = () => { found = []; renderFound(); $("findstate").textContent = ""; };
+}
+async function runDiscovery(body, label) {
+  $("find").disabled = true; $("probe").disabled = true;
+  $("findstate").textContent = label;
+  try {
+    const r = await api("POST", "api/setup/discover", body);
+    found = r.devices;
+    const n = found.length;
+    $("findstate").textContent = n
+      ? `${n} controller${n === 1 ? "" : "s"} answered${r.targets.length ? ` (asked ${r.targets.join(", ")})` : ""}.`
+      : `Nothing answered${r.targets.length ? ` on ${r.targets.join(", ")}` : ""}. Is this box on the Twinkly VLAN? You can still add a controller by IP.`;
+    renderFound();
+  } catch (e) { $("findstate").textContent = e.message; }
+  $("find").disabled = false; $("probe").disabled = false;
+}
+$("find").onclick = () => runDiscovery({ timeout: 3 }, "Looking for controllers (3 s)…");
+$("probe").onclick = () => {
+  const ip = $("probeip").value.trim();
+  if (!ip) return $("probeip").focus();
+  runDiscovery({ ip }, `Asking ${ip}…`);
+};
+$("probeip").addEventListener("keydown", (e) => { if (e.key === "Enter") $("probe").click(); });
+async function addPicked() {
+  const picks = [...$("found").querySelectorAll("[data-pick]:checked")].map((el) => found[Number(el.dataset.pick)]);
+  if (!picks.length) return;
+  const devices = picks.map((f) => ({ name: uniqueName(f.name || `Twinkly ${f.ip}`), ip: f.ip, pixels: f.info.number_of_led }));
+  try {
+    say("devmsg", `adding ${devices.length}…`);
+    const r = await api("POST", "api/setup/devices", { devices });
+    found = []; renderFound(); $("findstate").textContent = "";
+    applyResult(r, "devmsg");
+  } catch (e) { say("devmsg", e.message, "bad"); }
+}
+function uniqueName(name) {
+  const taken = new Set(state.devices.map((e) => e.spec.name || (e.derived && e.derived.name)));
+  let out = name, n = 2;
+  while (taken.has(out)) out = `${name} ${n++}`;
+  taken.add(out);
+  return out;
+}
+
+// ---- settings forms ----
+async function saveSection(section, container, msgId, extra) {
+  const values = collect(container);
+  try {
+    say(msgId, "saving…");
+    const r = await api("POST", "api/setup/settings", { [section]: values, ...(extra || {}) });
+    applyResult(r, msgId);
+  } catch (e) { say(msgId, e.message, "bad"); }
+}
+$("inputsave").onclick = () => saveSection("input", $("inputform"), "inputmsg");
+$("defsave").onclick = () => saveSection("defaults", $("defform"), "defmsg");
+$("mapsave").onclick = () => saveSection("mapping", $("mapform"), "mapmsg");
+$("websave").onclick = () => saveSection("web", $("webform"), "webmsg", { log_level: $("loglevel").value });
+
+// ---- yaml ----
+async function loadYaml() {
+  try {
+    const c = await api("GET", "api/config");
+    $("yaml").value = c.yaml;
+    $("yamlpath").textContent = c.path;
+  } catch (e) { say("yamlmsg", e.message, "bad"); }
+}
+$("yamlreload").onclick = loadYaml;
+$("yamlsave").onclick = async () => {
+  try {
+    say("yamlmsg", "saving…");
+    const r = await api("POST", "api/setup/yaml", { yaml: $("yaml").value });
+    applyResult(r, "yamlmsg");
+    loadYaml();
+  } catch (e) { say("yamlmsg", e.message, "bad"); }
+};
+
+// ---- page ----
+function renderAll(forms) {
+  const banners = [];
+  if (state.error) banners.push(`<div class="banner">The config file has a problem, fix it under “Config file” below: ${esc(state.error)}</div>`);
+  if (state.write_problem) banners.push(`<div class="banner warn">Read only: ${esc(state.write_problem)}</div>`);
+  if (state.reload_error && state.reload_error !== state.error) banners.push(`<div class="banner warn">${esc(state.reload_error)}</div>`);
+  state.warnings.forEach((w) => banners.push(`<div class="banner warn">${esc(w)}</div>`));
+  $("banner").innerHTML = banners.join("");
+  const ro = !!state.write_problem;
+  document.querySelectorAll("button").forEach((b) => { if (["find", "probe", "yamlreload", "clearfound", "edcancel"].includes(b.id)) return; if (ro) b.disabled = true; });
+  renderDevices();
+  if (forms) {
+    const inp = { ...state.input };
+    if (!inp.cidr && inp.ip) inp.cidr = inp.ip;
+    if (inp.artnet === undefined) inp.artnet = true;
+    if (inp.sacn === undefined) inp.sacn = false;
+    fill($("inputform"), inp);
+    fill($("defform"), state.defaults);
+    fill($("mapform"), state.mapping);
+    fill($("webform"), state.web);
+    $("loglevel").value = state.log_level || "info";
+    const eff = state.input_effective;
+    const nets = (state.networks || []).map((n) => `${n.name} ${n.ip}`).join(", ");
+    $("inputhint").textContent = (eff ? `Listening as ${eff.ip}${eff.prefix ? "/" + eff.prefix : ""}, ArtPollReply to ${eff.broadcast}. ` : "") + (nets ? `This box has: ${nets}.` : "");
+  }
+}
+async function load() {
+  try {
+    state = await api("GET", "api/setup/state");
+    renderAll(true);
+  } catch (e) {
+    $("banner").innerHTML = `<div class="banner">${esc(e.message)}</div>`;
+  }
+}
+async function pollStatus() {
+  if (!state) return;
+  try {
+    const s = await api("GET", "api/status");
+    state.running = Object.fromEntries((s.devices || []).map((d) => [d.name, { state: d.state, ip: d.ip, artnet: d.info ? d.info.artnet_enabled : null }]));
+    if ($("editor").hidden) renderDevices();
+  } catch (e) {}
+}
+load(); loadYaml();
+setInterval(pollStatus, 2000);
+</script>
+</body>
+</html>

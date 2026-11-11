@@ -65,14 +65,24 @@ class Supervisor:
             log.error("config reload failed, keeping the running config: %s", exc)
             return
         async with self._lock:
-            await self._swap_engine(config)
+            # A change that leaves the listen sockets and protocols the same
+            # (enabling/disabling/editing a controller, or a defaults/mapping/
+            # log tweak) is applied in place, so the unchanged controllers keep
+            # streaming. Only an input change restarts the whole engine.
+            if (
+                self.engine is not None
+                and self.engine.running
+                and self.config is not None
+                and config.input == self.config.input
+            ):
+                self._apply_shared(config)
+                await self.engine.apply_config(config)
+                self.config = config
+                self.config_error = ""
+            else:
+                await self._swap_engine(config)
 
-    async def _swap_engine(self, config: Config) -> None:
-        old = self.engine
-        if old is not None:
-            await old.stop()
-        self.config = config
-        self.config_error = ""
+    def _apply_shared(self, config: Config) -> None:
         if self.mapstore is not None:
             if config.mapping.dir and self.mapstore.root != config.mapping.dir:
                 log.warning("mapping.dir changed; restart the bridge to use %s", config.mapping.dir)
@@ -80,6 +90,14 @@ class Supervisor:
         logging.getLogger("twinklybridge").setLevel(config.log_level.upper())
         for warning in overlaps(config):
             log.warning("note: %s", warning)
+
+    async def _swap_engine(self, config: Config) -> None:
+        old = self.engine
+        if old is not None:
+            await old.stop()
+        self.config = config
+        self.config_error = ""
+        self._apply_shared(config)
         engine = Engine(config)
         try:
             await engine.start()

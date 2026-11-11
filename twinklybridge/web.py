@@ -1,24 +1,32 @@
-"""Status page, the phone mapping page and the JSON API (aiohttp)."""
+"""Status page, the setup page, the phone mapping page and the JSON API (aiohttp)."""
 
 from __future__ import annotations
 
+import asyncio
+import ipaddress
+import logging
+import os
 import pathlib
 import time
-from typing import TYPE_CHECKING
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any
 
 from aiohttp import web
 
-from . import mapping
-from .config import MAP_COLORS
+from . import configstore, mapping
+from .config import MAP_COLORS, ConfigError, parse_config
 from .engine import DeviceRunner, ScanError
 from .mapstore import StoreError
+from .twinkly import HTTP_PORT, Discovered, NotFound, TwinklyClient, TwinklyError, discover, local_networks
 
 if TYPE_CHECKING:
     from .app import Supervisor
 
 PAGE = pathlib.Path(__file__).parent / "status.html"
 MAP_PAGE = pathlib.Path(__file__).parent / "mapping.html"
+SETUP_PAGE = pathlib.Path(__file__).parent / "setup.html"
 NO_CACHE = {"Cache-Control": "no-cache"}
+log = logging.getLogger(__name__)
 
 
 async def index(request: web.Request) -> web.FileResponse:
@@ -27,6 +35,10 @@ async def index(request: web.Request) -> web.FileResponse:
 
 async def map_page(request: web.Request) -> web.FileResponse:
     return web.FileResponse(MAP_PAGE, headers=NO_CACHE)
+
+
+async def setup_page(request: web.Request) -> web.FileResponse:
+    return web.FileResponse(SETUP_PAGE, headers=NO_CACHE)
 
 
 async def api_status(request: web.Request) -> web.Response:
@@ -260,11 +272,241 @@ async def api_map_export(request: web.Request) -> web.Response:
     return web.FileResponse(path, headers={**NO_CACHE, "Content-Disposition": f'attachment; filename="{filename}"'})
 
 
+# --------------------------------------------------------------------------
+# Setup page: the config file and discovery
+# --------------------------------------------------------------------------
+
+
+async def _json_body(request: web.Request) -> dict | None:
+    """The request's JSON object; {} for an empty body; None when it is not an object."""
+    if not request.can_read_body:
+        return {}
+    try:
+        body = await request.json()
+    except ValueError:
+        return None
+    return body if isinstance(body, dict) else None
+
+
+def _running(dev: DeviceRunner) -> dict:
+    return {
+        "state": dev.state,
+        "ip": dev.cfg.ip,
+        "artnet": dev.info.artnet_enabled if dev.info is not None else None,
+    }
+
+
+def _setup_state(sup: Supervisor) -> dict:
+    try:
+        raw = configstore.load_raw(sup.config_path)
+        file_error = ""
+    except ConfigError as exc:
+        raw, file_error = {}, str(exc)
+    state = configstore.describe(raw, sup.config_path)
+    if file_error:
+        state["error"] = file_error
+    state["reload_error"] = sup.config_error
+    state["running"] = {d.name: _running(d) for d in sup.engine.devices} if sup.engine is not None else {}
+    state["networks"] = local_networks()
+    return state
+
+
+async def api_setup_state(request: web.Request) -> web.Response:
+    return web.json_response(_setup_state(request.app["supervisor"]))
+
+
+async def _save(request: web.Request, change: Callable[[dict], Any], text: str | None = None) -> web.Response:
+    """Load the file, apply change(raw) (which validates), write it with a backup, reload the bridge.
+
+    With text, that exact text is written instead of a regenerated file (the YAML editor).
+    """
+    sup: Supervisor = request.app["supervisor"]
+    async with request.app["config_lock"]:
+        try:
+            raw = configstore.load_raw(sup.config_path) if text is None else configstore.raw_from_text(text)
+            result = change(raw)
+            output = configstore.dump(raw) if text is None else text
+        except ConfigError as exc:
+            return _fail(str(exc))
+        try:
+            backup = configstore.write_text(sup.config_path, output)
+        except OSError as exc:
+            return _fail(f"cannot write {sup.config_path}: {exc.strerror or exc}", 500)
+        await sup.reload()
+    return web.json_response(
+        {
+            "ok": True,
+            "result": result,
+            "backup": os.path.basename(backup) if backup else "",
+            "reload_error": sup.config_error,
+            "state": _setup_state(sup),
+        }
+    )
+
+
+async def api_setup_devices_add(request: web.Request) -> web.Response:
+    body = await _json_body(request)
+    if body is None:
+        return _fail("expected JSON")
+    specs = body.get("devices")
+    if specs is None and isinstance(body.get("device"), dict):
+        specs = [body["device"]]
+    if not isinstance(specs, list) or not specs or not all(isinstance(x, dict) for x in specs):
+        return _fail("send device: {...} or devices: [{...}, ...]")
+    return await _save(request, lambda raw: configstore.add_devices(raw, specs))
+
+
+async def api_setup_device_replace(request: web.Request) -> web.Response:
+    body = await _json_body(request)
+    if body is None or not isinstance(body.get("device"), dict):
+        return _fail("send device: {...}")
+    name = request.match_info["name"]
+    return await _save(request, lambda raw: configstore.replace_device(raw, name, body["device"]))
+
+
+async def api_setup_device_patch(request: web.Request) -> web.Response:
+    body = await _json_body(request)
+    if body is None or not body:
+        return _fail("send the keys to change")
+    name = request.match_info["name"]
+    return await _save(request, lambda raw: configstore.patch_device(raw, name, body))
+
+
+async def api_setup_device_delete(request: web.Request) -> web.Response:
+    name = request.match_info["name"]
+    return await _save(request, lambda raw: configstore.remove_device(raw, name))
+
+
+async def api_setup_settings(request: web.Request) -> web.Response:
+    body = await _json_body(request)
+    if body is None or not body:
+        return _fail("send the sections to change: input, defaults, web, mapping, log_level")
+    return await _save(request, lambda raw: configstore.set_sections(raw, body))
+
+
+async def api_setup_yaml(request: web.Request) -> web.Response:
+    body = await _json_body(request)
+    if body is None or not isinstance(body.get("yaml"), str):
+        return _fail("send yaml: <the whole file>")
+    text = body["yaml"]
+    if not text.endswith("\n"):
+        text += "\n"
+
+    def validate(raw: dict) -> None:
+        parse_config(raw)
+
+    return await _save(request, validate, text=text)
+
+
+def _discovery_targets(sup: Supervisor, extra: str) -> list[str]:
+    targets = [extra] if extra else []
+    targets += [net["broadcast"] for net in local_networks()]
+    if sup.config is not None and sup.config.input.broadcast != "255.255.255.255":
+        targets.append(sup.config.input.broadcast)
+    targets.append("255.255.255.255")
+    return list(dict.fromkeys(targets))
+
+
+async def _probe(session: Any, found: Discovered) -> dict:
+    """Ask a controller what it is. No login, so a streaming device keeps its session."""
+    row = {"ip": found.ip, "name": found.name, "info": None, "error": ""}
+    try:
+        info = await TwinklyClient(session, found.ip, port=found.http_port, timeout=3.0).info()
+    except TwinklyError as exc:
+        text = str(exc)
+        if "Cannot connect" in text or "no answer" in text:
+            text = f"no answer from {found.ip}:{found.http_port} (off, unreachable, or not a Twinkly)"
+        row["error"] = text
+        return row
+    row["info"] = info.to_dict()
+    row["name"] = found.name or info.device_name
+    return row
+
+
+async def api_setup_discover(request: web.Request) -> web.Response:
+    import aiohttp
+
+    sup: Supervisor = request.app["supervisor"]
+    body = await _json_body(request)
+    if body is None:
+        return _fail("expected JSON")
+    ip = str(body.get("ip") or "").strip()
+    extra = str(body.get("broadcast") or "").strip()
+    for value in (ip, extra):
+        if value:
+            try:
+                ipaddress.IPv4Address(value)
+            except ValueError:
+                return _fail(f"{value!r} is not an IPv4 address")
+    try:
+        port = int(body.get("port") or HTTP_PORT)
+        timeout = min(10.0, max(0.5, float(body.get("timeout") or 2.0)))
+    except (TypeError, ValueError):
+        return _fail("port and timeout must be numbers")
+    if ip:
+        targets: list[str] = []
+        found = [Discovered(ip=ip, name="", http_port=port)]
+    else:
+        targets = _discovery_targets(sup, extra)
+        found = await asyncio.to_thread(discover, targets, timeout)
+    configured = {d.ip: d.name for d in sup.config.devices} if sup.config is not None else {}
+    async with aiohttp.ClientSession() as session:
+        rows = await asyncio.gather(*(_probe(session, d) for d in found))
+    for row in rows:
+        row["configured_as"] = configured.get(row["ip"])
+    return web.json_response({"ok": True, "targets": targets, "devices": list(rows)})
+
+
+async def api_setup_artnet(request: web.Request) -> web.Response:
+    """Switch a controller's built-in Art-Net mode off (or on). A persistent change on the controller."""
+    import aiohttp
+
+    sup: Supervisor = request.app["supervisor"]
+    body = await _json_body(request)
+    if body is None:
+        return _fail("expected JSON")
+    ip = str(body.get("ip") or "").strip()
+    try:
+        ipaddress.IPv4Address(ip)
+        port = int(body.get("port") or HTTP_PORT)
+    except ValueError:
+        return _fail("send ip (IPv4) and optionally port")
+    enable = body.get("enable")
+    if not isinstance(enable, bool):
+        return _fail("enable must be true or false")
+    runner = None
+    if sup.engine is not None:
+        runner = next((d for d in sup.engine.devices if d.cfg.ip == ip), None)
+    client = getattr(runner, "client", None)
+    if client is not None and client.token:
+        session = None  # the bridge's own session and token: no second login on a streaming controller
+    else:
+        session = aiohttp.ClientSession()
+        client = TwinklyClient(session, ip, port=port, timeout=5.0)
+    try:
+        if session is not None:
+            await client.login()
+        after = await client.set_artnet(enable)
+    except NotFound:
+        return _fail(f"{ip}: this firmware has no built-in Art-Net setting (consumer device?)", 400)
+    except TwinklyError as exc:
+        return _fail(f"{ip}: {exc}", 502)
+    finally:
+        if session is not None:
+            await session.close()
+    if runner is not None and runner.info is not None:
+        runner.info.artnet_enabled = bool(after.get("enable"))
+    log.info("built-in Art-Net on %s switched %s from the setup page", ip, "on" if enable else "off")
+    return web.json_response({"ok": True, "ip": ip, "artnet": after})
+
+
 def make_app(supervisor: Supervisor) -> web.Application:
     app = web.Application()
     app["supervisor"] = supervisor
+    app["config_lock"] = asyncio.Lock()
     app.router.add_get("/", index)
     app.router.add_get("/map", map_page)
+    app.router.add_get("/setup", setup_page)
     app.router.add_get("/api/status", api_status)
     app.router.add_get("/api/log", api_log)
     app.router.add_get("/api/config", api_config)
@@ -277,6 +519,15 @@ def make_app(supervisor: Supervisor) -> web.Application:
     app.router.add_get("/api/map/jobs/{slug}/{job}/{name}", api_map_file)
     app.router.add_delete("/api/map/jobs/{slug}/{job}", api_map_delete)
     app.router.add_get("/api/map/export/{slug}/{source}/{kind}", api_map_export)
+    app.router.add_get("/api/setup/state", api_setup_state)
+    app.router.add_post("/api/setup/devices", api_setup_devices_add)
+    app.router.add_put("/api/setup/devices/{name}", api_setup_device_replace)
+    app.router.add_route("PATCH", "/api/setup/devices/{name}", api_setup_device_patch)
+    app.router.add_delete("/api/setup/devices/{name}", api_setup_device_delete)
+    app.router.add_post("/api/setup/settings", api_setup_settings)
+    app.router.add_post("/api/setup/yaml", api_setup_yaml)
+    app.router.add_post("/api/setup/discover", api_setup_discover)
+    app.router.add_post("/api/setup/artnet", api_setup_artnet)
     return app
 
 

@@ -101,6 +101,28 @@ the container, allow UDP 6454 (Art-Net), 5568 (sACN), 5555 (discovery) and
 
 ## Set up 20 controllers in a minute
 
+Open `http://<bridge-ip>:8080/setup` on your phone or laptop. **Find
+controllers** broadcasts on every network the bridge box is on and lists what
+answers (name, model, LED count, firmware, whether it is still in a group or
+has built-in Art-Net on). Tick the ones you want and tap **Add selected**:
+universes are assigned one after another from the first free one. A
+controller that doesn't answer the broadcast can be looked up by IP. A
+controller whose built-in Art-Net mode is still on (it fights the bridge) is
+flagged with a **Turn it off** button, one by one or all at once; that is
+saved on the controller itself, like switching it in the Twinkly Pro app.
+
+The same page edits everything else: each controller (universe, pixels,
+layout, fps, what to do when input stops, enabled), the console-side input,
+the defaults, the camera-mapping settings and the raw file. Every save is
+validated first, keeps the previous file next to it as
+`config.yaml.<time>.bak` (the last 5), and reloads the bridge, which restarts
+the streams for about a second. Saving from a form rewrites the file in a
+standard layout, so hand-written comments go; the raw editor keeps the text as
+typed. The page has no login: anyone on the VLAN who can reach port 8080 can
+change the config, like today with `systemctl reload`.
+
+From a terminal instead:
+
 ```bash
 twinkly-bridge discover                         # list what's on the network
 twinkly-bridge discover --yaml > devices.yaml   # ready-to-paste devices: block
@@ -116,7 +138,8 @@ sudo systemctl reload twinkly-bridge                      # apply
 ```
 
 Open `http://<bridge-ip>:8080` to see every controller: its state, input rate,
-output fps, firmware and LED count.
+output fps, firmware and LED count. `/setup` edits the config, `/map` maps
+pixel positions with a camera.
 
 ## Config
 
