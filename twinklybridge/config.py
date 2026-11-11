@@ -73,6 +73,10 @@ class DeviceConfig:
     enabled: bool = True
     http_port: int = HTTP_PORT
     rt_port: int = RT_PORT
+    # Art-Net only: the bridge IP this device's universes arrive on ("" = the main
+    # input IP). Set different listen_ips (each fed by its own unicast Resolume
+    # output) to carry more than 256 universes, since Resolume can't set the Net field.
+    listen_ip: str = ""
 
     @property
     def channels(self) -> int:
@@ -137,6 +141,39 @@ class Config:
 
 def format_universe(protocol: str, universe: int) -> str:
     return artnet.format_universe(universe) if protocol == ARTNET else str(universe)
+
+
+SACN_FEED = "sacn"  # sACN is not segmented by IP; it shares one feed key
+
+
+def device_feed(device: DeviceConfig, inp: InputConfig) -> str:
+    """The local listen IP this device's packets arrive on.
+
+    Art-Net segments can use different IPs so Resolume (which can't set the
+    Art-Net Net field) can feed more than 256 universes by unicasting each
+    segment to its own IP. sACN has a flat 16-bit universe and is not segmented.
+    """
+    if device.protocol != ARTNET:
+        return SACN_FEED
+    return device.listen_ip or inp.ip
+
+
+def artnet_feeds(config: Config) -> list[str]:
+    """Distinct Art-Net listen IPs across enabled devices, in first-seen order."""
+    feeds: list[str] = []
+    for d in config.enabled_devices:
+        if d.protocol != ARTNET:
+            continue
+        f = device_feed(d, config.input)
+        if f not in feeds:
+            feeds.append(f)
+    return feeds
+
+
+def listen_feeds(config: Config) -> list[str]:
+    """The Art-Net listen IPs the engine actually binds: the device feeds, or the
+    input IP alone when no Art-Net device is configured (so ArtPoll is still answered)."""
+    return artnet_feeds(config) or [config.input.ip]
 
 
 def build_segments(
@@ -330,8 +367,9 @@ DEVICE_KEYS = {
     "enabled",
     "http_port",
     "rt_port",
+    "listen_ip",
 }
-DEFAULT_KEYS = DEVICE_KEYS - {"name", "ip", "universe", "pixels", "enabled"}
+DEFAULT_KEYS = DEVICE_KEYS - {"name", "ip", "universe", "pixels", "enabled", "listen_ip"}
 
 
 def _parse_device(index: int, raw: Any, defaults: dict, inp: InputConfig) -> DeviceConfig:
@@ -361,6 +399,11 @@ def _parse_device(index: int, raw: Any, defaults: dict, inp: InputConfig) -> Dev
     start = _int(merged.get("start_channel"), where("start_channel"), 1, 1, DMX_SLOTS - channels + 1)
     ppu = _int(merged.get("pixels_per_universe"), where("pixels_per_universe"), 0, 0, DMX_SLOTS // channels)
     order = _layout(merged.get("order"), where("order"), "auto", allow_auto=True)
+    listen_ip = ""
+    if spec.get("listen_ip") is not None:
+        if protocol != ARTNET:
+            raise ConfigError(f"{path}.listen_ip: only Art-Net devices use listen_ip")
+        listen_ip = _ipv4(spec.get("listen_ip"), f"{path}.listen_ip")
 
     device = DeviceConfig(
         name=name,
@@ -378,6 +421,7 @@ def _parse_device(index: int, raw: Any, defaults: dict, inp: InputConfig) -> Dev
         enabled=_bool(spec.get("enabled"), f"{path}.enabled", True),
         http_port=_int(merged.get("http_port"), where("http_port"), HTTP_PORT, 1, 65535),
         rt_port=_int(merged.get("rt_port"), where("rt_port"), RT_PORT, 1, 65535),
+        listen_ip=listen_ip,
     )
     last = device.universes[-1]
     limit = artnet.MAX_PORT_ADDRESS if protocol == ARTNET else sacn.MAX_UNIVERSE
@@ -424,6 +468,13 @@ def parse_config(raw: Any) -> Config:
             raise ConfigError(f"devices: the name '{d.name}' is used twice")
         seen_names.add(d.name)
 
+    feeds = {d.listen_ip or inp.ip for d in devices if d.enabled and d.protocol == ARTNET}
+    if len(feeds) > 1 and "0.0.0.0" in feeds:
+        raise ConfigError(
+            "splitting Art-Net across IPs (device listen_ip) needs a specific input IP: "
+            "set input.cidr to this box's address, or give every device a listen_ip"
+        )
+
     web_raw = _mapping(top.get("web"), "web")
     _unknown_keys(web_raw, {"enabled", "bind", "port"}, "web")
     web = WebConfig(
@@ -454,13 +505,18 @@ def parse_config(raw: Any) -> Config:
 
 
 def overlaps(config: Config) -> list[str]:
-    """Human readable warnings for universes used by more than one device."""
-    users: dict[tuple[str, int], list[str]] = {}
+    """Human readable warnings for universes used by more than one device.
+
+    Keyed by feed, so two devices reusing a universe on different listen IPs
+    (the whole point of segmentation) are not flagged.
+    """
+    users: dict[tuple[str, str, int], list[str]] = {}
     for d in config.enabled_devices:
+        feed = device_feed(d, config.input)
         for u in d.universes:
-            users.setdefault((d.protocol, u), []).append(d.name)
+            users.setdefault((d.protocol, feed, u), []).append(d.name)
     out = []
-    for (protocol, u), names in sorted(users.items()):
+    for (protocol, _feed, u), names in sorted(users.items()):
         if len(names) > 1:
             out.append(f"{protocol} universe {format_universe(protocol, u)} feeds {', '.join(names)}")
     return out

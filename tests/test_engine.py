@@ -58,7 +58,7 @@ def test_unmapped_universe_is_listed_and_own_packets_ignored():
     eng = Engine(cfg, sender=lambda p, a: True)
     eng.handle_artnet(artnet.encode_dmx(7, b"\x01\x02"), "2.0.0.1")
     eng.handle_artnet(artnet.encode_dmx(0, b"\x01\x02"), BRIDGE_IP)  # our own echo
-    assert list(eng.unmapped) == [("artnet", 7)]
+    assert list(eng.unmapped) == [("artnet", BRIDGE_IP, 7)]  # (protocol, feed, universe)
     assert eng.devices[0].rx.total == 0
 
 

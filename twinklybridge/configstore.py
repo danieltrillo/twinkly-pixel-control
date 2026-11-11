@@ -38,6 +38,7 @@ DEVICE_ORDER = (
     "universe",
     "pixels",
     "protocol",
+    "listen_ip",
     "input",
     "order",
     "start_channel",
@@ -464,6 +465,7 @@ def describe(raw: dict, path: str) -> dict:
             entry["derived"] = {
                 "name": d.name,
                 "protocol": d.protocol,
+                "listen_ip": d.listen_ip,
                 "universes": d.universe_label,
                 "universe_count": len(d.segments),
                 "first_universe": format_universe(d.protocol, d.universes[0]),

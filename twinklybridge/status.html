@@ -41,6 +41,7 @@
   <span style="flex:1"></span>
   <a href="setup" style="color:inherit">Setup</a>
   <a href="map" style="color:inherit">Pixel mapping</a>
+  <button id="reassert" title="Force every controller back into realtime mode now (use if any have dropped to their own stored content)">Reassert realtime</button>
   <button id="reload" title="Re-read the config file">Reload config</button>
 </header>
 <main>
@@ -119,6 +120,15 @@ $("reload").onclick = async () => {
   const r = await (await fetch("api/reload", { method: "POST" })).json();
   if (!r.ok) alert(r.error);
   refresh();
+};
+$("reassert").onclick = async () => {
+  const b = $("reassert"), label = b.textContent;
+  b.disabled = true; b.textContent = "Reasserting…";
+  try {
+    const r = await (await fetch("api/reassert", { method: "POST" })).json();
+    if (!r.ok) alert(r.error);
+  } catch (e) { alert("Reassert failed — lost contact with the bridge"); }
+  b.textContent = label; b.disabled = false; refresh();
 };
 refresh(); refreshLog();
 setInterval(refresh, 1000);
