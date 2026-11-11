@@ -400,10 +400,15 @@ def local_networks() -> list[dict]:
     try:
         import fcntl
         import struct
-
-        names = [name for _, name in socket.if_nameindex()]
-    except (OSError, ImportError, AttributeError):
+    except ImportError:
         return out
+    try:
+        names = sorted(os.listdir("/sys/class/net"))  # no netlink needed (systemd sandboxes block it)
+    except OSError:
+        try:
+            names = [name for _, name in socket.if_nameindex()]
+        except (OSError, AttributeError):
+            return out
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         for name in names:
