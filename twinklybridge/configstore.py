@@ -63,6 +63,8 @@ MAPPING_ORDER = (
     "color",
     "passes",
     "decode_width",
+    "comp_width",
+    "comp_height",
 )
 SECTIONS = {
     "input": INPUT_KEYS,
@@ -83,6 +85,8 @@ _INT_KEYS = {
     "brightness",
     "passes",
     "decode_width",
+    "comp_width",
+    "comp_height",
 }
 _FLOAT_KEYS = {"fps", "packet_gap_ms", "loss_timeout", "slot"}
 _BOOL_KEYS = {"enabled", "artnet", "sacn", "keep_clips", "coalesce"}

@@ -71,11 +71,12 @@ def _gray(frame: np.ndarray) -> np.ndarray:
 
 
 def _resize(img: np.ndarray, max_width: int) -> np.ndarray:
+    """Shrink so the long side is at most max_width (portrait clips cost the same memory as landscape)."""
     h, w = img.shape[:2]
-    if w <= max_width:
+    if max(w, h) <= max_width:
         return img
-    scale = max_width / w
-    return cv2.resize(img, (max_width, round(h * scale)), interpolation=cv2.INTER_AREA)
+    scale = max_width / max(w, h)
+    return cv2.resize(img, (round(w * scale), round(h * scale)), interpolation=cv2.INTER_AREA)
 
 
 def read_trace(path: str, small_width: int = 160) -> tuple[np.ndarray, np.ndarray, float, tuple[int, int]]:
@@ -614,6 +615,41 @@ def _bundle_adjust(views, fov, points, thr, refine_fov, max_nfev=100, inliers=No
     return {p: pts[pindex[p]] for p in pids}, float(fv)
 
 
+def _triangulate_all(views, fov, thr, points, inliers, min_views=2) -> None:
+    """(Re)fill points and inliers from every registered view."""
+    points.clear()
+    inliers.clear()
+    seen = set().union(*(v.pts.keys() for v in views if v.registered))
+    for pid in seen:
+        xyz = _robust_point(views, fov, pid, 3 * thr)
+        if xyz is None:
+            continue
+        ag = _agreeing(views, fov, pid, xyz, 3 * thr)
+        if len(ag) >= min_views:
+            points[pid] = xyz
+            inliers[pid] = {v.name for v in ag}
+
+
+def _sample_docs(docs: list[dict], max_points: int, seed: int = 0) -> list[dict] | None:
+    """The same clips cut down to max_points pixels (the ones most clips saw), or None if already small.
+
+    Placing the cameras only needs a few thousand pixels; a whole rig has tens of
+    thousands, and every solver round is per pixel in Python. The full set is
+    triangulated once at the end with the cameras found here.
+    """
+    seen: dict[int, int] = {}
+    for d in docs:
+        for f in d["found"]:
+            seen[f["pixel"]] = seen.get(f["pixel"], 0) + 1
+    if max_points <= 0 or len(seen) <= max_points:
+        return None
+    rng = np.random.default_rng(seed)
+    multi = [p for p, c in seen.items() if c >= 2]
+    pool = multi if len(multi) >= max_points else list(seen)
+    keep = set(rng.choice(sorted(pool), size=min(max_points, len(pool)), replace=False).tolist())
+    return [{**d, "found": [f for f in d["found"] if f["pixel"] in keep]} for d in docs]
+
+
 def _reconstruct(docs, names, fov, thr, fix_fov, log=print):
     """Place every camera and triangulate every pixel. Returns (views, points, inliers, fov) or None."""
     views = [View(d, nm) for d, nm in zip(docs, names, strict=True)]
@@ -628,17 +664,7 @@ def _reconstruct(docs, names, fov, thr, fix_fov, log=print):
     inliers: dict[int, set[str]] = {}  # which views' sightings of a pixel agree; the rest sit out
 
     def retriangulate(min_views=2):
-        points.clear()
-        inliers.clear()
-        seen = set().union(*(v.pts.keys() for v in views if v.registered))
-        for pid in seen:
-            xyz = _robust_point(views, fov, pid, 3 * thr)
-            if xyz is None:
-                continue
-            ag = _agreeing(views, fov, pid, xyz, 3 * thr)
-            if len(ag) >= min_views:
-                points[pid] = xyz
-                inliers[pid] = {v.name for v in ag}
+        _triangulate_all(views, fov, thr, points, inliers, min_views)
 
     retriangulate()
     # add the other views one by one: the one that sees most solved points first
@@ -695,6 +721,11 @@ def cmd_solve3d(a) -> int:
     n = docs[0]["pixels"]
     thr = a.ransac
     fov = a.fov
+    full_docs = docs
+    sampled = _sample_docs(docs, a.max_points)
+    if sampled is not None:
+        docs = sampled
+        print(f"placing the cameras with {a.max_points} of the pixels, then triangulating all of them")
     if fov is None:
         # a wrong field of view can break the chain of cameras, so try a few phone-like ones first
         def quiet(*_):
@@ -717,6 +748,12 @@ def cmd_solve3d(a) -> int:
             "no two clips both overlap and sit far enough apart: film from different spots, 30-60 degrees apart, with the whole rig in frame"
         )
     views, points, inliers, fov = got
+    if sampled is not None:
+        full = [View(d, nm) for d, nm in zip(full_docs, names, strict=True)]
+        for fv, sv in zip(full, views, strict=True):
+            fv.rvec, fv.tvec = sv.rvec, sv.tvec
+        views = full
+        _triangulate_all(views, fov, thr, points, inliers)
     reg = [v for v in views if v.registered]
     if len(reg) >= 3 and sum(len(inliers[p]) >= 3 for p in points) < 0.1 * max(len(points), 1):
         print(
@@ -904,7 +941,75 @@ def _nearest_free(cell, taken):
     return cell
 
 
-def write_madrix(path: str, found, cells, patch, a) -> None:
+@dataclass
+class PixelPatch:
+    """Where one mapped pixel's channels arrive at the bridge."""
+
+    universe: int  # Art-Net 15-bit port address (net.subnet.universe) or sACN universe
+    channel: int  # 1-based DMX channel of its first colour
+    group: tuple  # pixels with the same group share one Resolume lumiverse
+    label: str  # fixture name, e.g. "Tree 3 17"
+
+
+def _group_for(feed: str, universe: int) -> tuple:
+    # Resolume reaches 256 universes per output (Sub-Net + Universe, no Net field), so one
+    # lumiverse per Art-Net net, and per bridge IP when the rig is split across listen IPs
+    return (feed, universe >> 8)
+
+
+def pixel_patches(a, n_pixels: int) -> dict[int, PixelPatch]:
+    """Map pixel number -> PixelPatch, from a rig manifest, the bridge config or --universe."""
+    if getattr(a, "rig", None):
+        return rig_patch(load_rig(a.rig))
+    out = {}
+    for i, (uni, ch) in enumerate(patch_for(a, n_pixels)):
+        out[i] = PixelPatch(uni, ch, _group_for("", uni), f"{a.name} {i + 1}")
+    return out
+
+
+# --------------------------------------------------------------------------
+# Whole-rig scans: every controller blinks at once, one pixel number space
+# --------------------------------------------------------------------------
+
+RIG_KIND = "twinkly-rig"
+
+
+def load_rig(path: str) -> dict:
+    with open(path, encoding="utf-8") as fh:
+        rig = json.load(fh)
+    if rig.get("kind") != RIG_KIND:
+        raise SystemExit(f"{path} is not a rig manifest (kind {RIG_KIND!r})")
+    return rig
+
+
+def rig_lookup(rig: dict, pixel: int) -> tuple[dict, int] | None:
+    """(device entry, pixel number on that controller) for a rig-wide pixel number."""
+    for d in rig["devices"]:
+        if d["offset"] <= pixel < d["offset"] + d["pixels"]:
+            return d, pixel - d["offset"]
+    return None
+
+
+def rig_patch(rig: dict) -> dict[int, PixelPatch]:
+    """Rig-wide pixel number -> where the bridge reads it, from the manifest the scan wrote."""
+    out = {}
+    for d in rig["devices"]:
+        ch = int(d.get("channels", 4))
+        for seg in d["segments"]:
+            for k in range(seg["count"]):
+                local = seg["first_pixel"] + k
+                if local >= d["pixels"]:
+                    continue  # patched but not shown by the scan: can't have been found
+                out[d["offset"] + local] = PixelPatch(
+                    universe=seg["universe"],
+                    channel=seg["channel"] + k * ch + 1,
+                    group=_group_for(d.get("feed", ""), seg["universe"]),
+                    label=f"{d['name']} {local + 1}",
+                )
+    return out
+
+
+def write_madrix(path: str, found, cells, patches: dict[int, PixelPatch], a) -> None:
     """MADRIX 5 Patch Editor > Import Fixture List (CSV). Map the columns in the import dialog."""
     with open(path, "w", newline="", encoding="utf-8") as fh:
         w = csv.writer(fh)
@@ -912,94 +1017,338 @@ def write_madrix(path: str, found, cells, patch, a) -> None:
             ["Product", "Fixture ID", "Name", "Position X", "Position Y", "Position Z", "DMX Universe", "DMX Channel"]
         )
         for f, cell in zip(found, cells, strict=True):
-            uni, ch = patch[f["pixel"]]
+            pp = patches[f["pixel"]]
             z = cell[2] if len(cell) == 3 else 0
             w.writerow(
                 [
                     a.product,
                     a.fixture_id_base + f["pixel"],
-                    f"{a.name} {f['pixel'] + 1}",
+                    pp.label,
                     cell[0] + a.madrix_origin,
                     cell[1] + a.madrix_origin,
                     z + a.madrix_origin,
-                    uni + a.madrix_universe_offset,
-                    ch,
+                    pp.universe + a.madrix_universe_offset,
+                    pp.channel,
                 ]
             )
 
 
-def write_resolume(path: str, found, patch, a, dims: int) -> None:
-    """Resolume Arena 7 Advanced Output preset: one Lumiverse, one 1x1 fixture slice per pixel."""
-    pts = np.array([[f["x"], f["y"]] for f in found], np.float64)
-    if dims == 3:
-        pts[:, 1] *= -1  # front view, Y down like the composition
-    comp_w, comp_h = a.comp
-    lo, hi = pts.min(axis=0), pts.max(axis=0)
-    span = np.maximum(hi - lo, 1e-9)
-    margin = 0.04 * min(comp_w, comp_h)
-    scale = min((comp_w - 2 * margin) / span[0], (comp_h - 2 * margin) / span[1])
-    xy = (pts - lo) * scale
-    xy += [(comp_w - span[0] * scale) / 2, (comp_h - span[1] * scale) / 2]
-    # sample square: a bit under the typical spacing between neighbours
-    if len(xy) > 1:
-        from_each = [np.partition(np.linalg.norm(xy - p, axis=1), 1)[1] for p in xy[: min(len(xy), 400)]]
-        size = float(np.clip(0.6 * np.median(from_each), 1.0, 40.0))
+# --------------------------------------------------------------------------
+# Where each pixel lands on the Resolume composition
+# --------------------------------------------------------------------------
+
+
+def _vertical_axis(xyz: np.ndarray) -> np.ndarray:
+    """The tree's trunk direction: its long axis if that is close to 'up' (+Y), else +Y."""
+    up = np.array([0.0, 1.0, 0.0])
+    if len(xyz) < 10:
+        return up
+    c = xyz - xyz.mean(axis=0)
+    w, v = np.linalg.eigh(c.T @ c)
+    axis = v[:, int(np.argmax(w))]
+    if axis @ up < 0:
+        axis = -axis
+    # only trust it for something clearly taller than it is wide and roughly upright
+    if w.max() > 1.5 * np.sort(w)[-2] and axis @ up > math.cos(math.radians(25)):
+        return axis / np.linalg.norm(axis)
+    return up
+
+
+def unwrap_cylinder(xyz: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """3D points -> (u, v) in 0..1: u = angle around the trunk, v = height (0 at the top).
+
+    The front (toward the first camera, +Z after solve3d) lands in the middle of
+    the canvas, so the seam where the wrap closes is at the back.
+    """
+    y = _vertical_axis(xyz)
+    z = np.array([0.0, 0.0, 1.0]) - y * y[2]
+    if np.linalg.norm(z) < 1e-6:
+        z = np.array([1.0, 0.0, 0.0]) - y * y[0]
+    z /= np.linalg.norm(z)
+    x = np.cross(y, z)
+    h, px, pz = xyz @ y, xyz @ x, xyz @ z
+    # trunk position: middle of each height band's extent, so a side seen by fewer
+    # cameras (fewer pixels) doesn't drag the centre toward the other side
+    lo, hi = float(h.min()), float(h.max())
+    edges = np.linspace(lo, hi, 11)
+    cx, cz = [], []
+    for b in range(10):
+        sel = (h >= edges[b]) & (h <= edges[b + 1])
+        if sel.sum() >= 8:
+            cx.append((px[sel].min() + px[sel].max()) / 2)
+            cz.append((pz[sel].min() + pz[sel].max()) / 2)
+    ax = float(np.median(cx)) if cx else float(np.median(px))
+    az = float(np.median(cz)) if cz else float(np.median(pz))
+    theta = np.arctan2(px - ax, pz - az)  # 0 = front, +/-pi = back
+    u = (theta + math.pi) / (2 * math.pi)
+    v = (hi - h) / max(hi - lo, 1e-9)
+    return u, v
+
+
+def _nearest_distances(xy: np.ndarray) -> np.ndarray:
+    if len(xy) < 2:
+        return np.full(len(xy), np.inf)
+    try:
+        from scipy.spatial import cKDTree
+    except ImportError:  # pragma: no cover - scipy is part of the mapping extras
+        out = np.empty(len(xy))
+        for i, p in enumerate(xy):
+            out[i] = np.partition(np.linalg.norm(xy - p, axis=1), 1)[1]
+        return out
+    d, _ = cKDTree(xy).query(xy, k=2)
+    return d[:, 1]
+
+
+def canvas_layout(
+    found: list[dict], dims: int, comp: tuple[int, int], layout: str
+) -> tuple[np.ndarray, np.ndarray, str]:
+    """Composition position (centre) and sample-square size for every found pixel.
+
+    layout "front": the 2D picture (or the 3D map seen from the front), scaled to fit.
+    layout "cylinder": 3D only; unwrapped around the trunk to fill the whole canvas.
+    """
+    comp_w, comp_h = comp
+    if layout == "auto":
+        layout = "cylinder" if dims == 3 else "front"
+    if layout == "cylinder":
+        if dims != 3:
+            raise SystemExit("the cylinder unwrap needs a 3D map: export the 3D solve, not a single clip")
+        xyz = np.array([[f["x"], f["y"], f["z"]] for f in found], np.float64)
+        u, v = unwrap_cylinder(xyz)
+        nn = _nearest_distances(np.stack([u * comp_w, v * comp_h], axis=1))
+        base = float(np.clip(0.7 * np.median(nn), 1.0, 40.0))
+        margin = base / 2 + 1
+        # keep every sample square inside the composition, including at the seam
+        xy = np.stack([margin + u * (comp_w - 2 * margin), margin + v * (comp_h - 2 * margin)], axis=1)
     else:
-        size = 8.0
-    first_uni = min(u for u, _ in patch)
-    fixture_uuid = uuid.uuid4().hex
-    color = a.resolume_color
-    stamp = int(time.time() * 1000)
-    slices = []
-    for k, (f, (x, y)) in enumerate(zip(found, xy, strict=True)):
-        uni, ch = patch[f["pixel"]]
-        start = (uni - first_uni) * DMX_SLOTS + ch
-        h = size / 2
-        slices.append(
-            _RES_SLICE.format(
-                uid=stamp + k + 1,
-                name=f"{a.name} {f['pixel'] + 1}",
-                fixture_uuid=fixture_uuid,
-                start=start,
-                start_phase=(start - 1) / 131071,
-                x0=x - h,
-                y0=y - h,
-                x1=x + h,
-                y1=y + h,
-                color=color,
+        pts = np.array([[f["x"], f["y"]] for f in found], np.float64)
+        if dims == 3:
+            pts[:, 1] *= -1  # front view, Y down like the composition
+        lo, hi = pts.min(axis=0), pts.max(axis=0)
+        span = np.maximum(hi - lo, 1e-9)
+        margin = 0.04 * min(comp_w, comp_h)
+        scale = min((comp_w - 2 * margin) / span[0], (comp_h - 2 * margin) / span[1])
+        xy = (pts - lo) * scale
+        xy += [(comp_w - span[0] * scale) / 2, (comp_h - span[1] * scale) / 2]
+    # sample square: a bit under the distance to the nearest neighbour, so squares don't
+    # overlap where pixels are dense and don't shrink to nothing where they're sparse
+    nn = _nearest_distances(xy)
+    if np.isfinite(nn).any():
+        med = float(np.median(nn[np.isfinite(nn)]))
+        sizes = np.clip(0.7 * nn, max(1.0, 0.5 * med), max(1.0, min(40.0, 1.5 * med)))
+        sizes = np.where(np.isfinite(sizes), sizes, max(1.0, min(40.0, 1.5 * med)))
+    else:
+        sizes = np.full(len(xy), 8.0)
+    return xy, sizes, layout
+
+
+def preview_canvas(path: str, xy: np.ndarray, sizes: np.ndarray, keys: list, comp: tuple[int, int]) -> None:
+    """The composition with every sample square, coloured by lumiverse / controller."""
+    comp_w, comp_h = comp
+    scale = min(1.0, 1280 / comp_w)
+    img = np.full((int(comp_h * scale), int(comp_w * scale), 3), 18, np.uint8)
+    order = sorted(set(keys), key=str)
+    for (x, y), s, k in zip(xy, sizes, keys, strict=True):
+        hue = int(170 * order.index(k) / max(len(order), 1))
+        col = cv2.cvtColor(np.uint8([[[hue, 220, 255]]]), cv2.COLOR_HSV2BGR)[0, 0].tolist()
+        h = max(0.5, s * scale / 2)
+        cv2.rectangle(
+            img,
+            (int(x * scale - h), int(y * scale - h)),
+            (int(math.ceil(x * scale + h)), int(math.ceil(y * scale + h))),
+            col,
+            -1,
+        )
+    cv2.imwrite(path, img)
+
+
+# --------------------------------------------------------------------------
+# Resolume Arena Advanced Output preset
+# --------------------------------------------------------------------------
+
+
+def write_resolume(path: str, found, patches: dict[int, PixelPatch], xy, sizes, a) -> list[dict]:
+    """Resolume Arena 7 Advanced Output preset: one Lumiverse per group, one 1x1 fixture slice per pixel.
+
+    Returns a summary per lumiverse.
+    """
+    comp_w, comp_h = a.comp
+    groups: dict[tuple, list[int]] = {}
+    for k, f in enumerate(found):
+        pp = patches.get(f["pixel"])
+        if pp is not None:
+            groups.setdefault(pp.group, []).append(k)
+    instance_uuid = uuid.uuid4().hex
+    uid = int(time.time() * 1000)
+    screens, summary = [], []
+    for li, gkey in enumerate(sorted(groups, key=lambda g: (g[0], g[1]))):
+        members = groups[gkey]
+        base = min(patches[found[k]["pixel"]].universe for k in members)
+        last = max(patches[found[k]["pixel"]].universe for k in members)
+        uid += 1
+        name = f"Lumiverse {li + 1}"
+        slices = []
+        ordered = sorted(
+            members, key=lambda k: (patches[found[k]["pixel"]].universe, patches[found[k]["pixel"]].channel)
+        )
+        channels = 4 if a.resolume_color == "rgbw" else 3
+        for run in line_runs(ordered, found, patches, xy, a.line_tolerance, channels, comp_w):
+            p_first, p_last = patches[found[run[0]]["pixel"]], patches[found[run[-1]]["pixel"]]
+            start = (p_first.universe - base) * DMX_SLOTS + p_first.channel
+            corners, angle = _run_rect(xy[run], float(np.mean(sizes[run])))
+            label = p_first.label if len(run) == 1 else f"{p_first.label}-{p_last.label.rsplit(' ', 1)[-1]}"
+            uid += 1
+            slices.append(
+                (_RES_SLICE_COMPACT if a.resolume_compact else _RES_SLICE).format(
+                    uid=uid,
+                    name=_xml_attr(label),
+                    fixture_id=a.resolume_fixture_id,
+                    instance=instance_uuid,
+                    start=start,
+                    orientation=_num(angle, 8),
+                    v="".join(f'<v x="{_num(cx)}" y="{_num(cy)}"/>' for cx, cy in corners),
+                    height=len(run),
+                    color=a.resolume_color,
+                )
+            )
+        screens.append(
+            _RES_SCREEN_HEAD.format(name=name, uid=uid, lumi=li)
+            + "".join(slices)
+            + _RES_SCREEN_TAIL.format(
+                target=a.resolume_target, subnet=(base >> 4) & 0xF, universe=base & 0xF, fps=a.resolume_fps
             )
         )
-    xml = _RES_HEAD.format(name=a.name, w=comp_w, h=comp_h, uid=stamp, lumi=a.name) + "".join(slices)
-    xml += _RES_TAIL.format(subnet=(first_uni >> 4) & 0xF, universe=first_uni & 0xF, target=a.resolume_target)
+        summary.append(
+            {
+                "name": name,
+                "feed": gkey[0],
+                "net": gkey[1],
+                "first": artnet_label(base),
+                "last": artnet_label(last),
+                "pixels": len(members),
+                "slices": len(slices),
+                "resolume_subnet": (base >> 4) & 0xF,
+                "resolume_universe": base & 0xF,
+            }
+        )
+    xml = _RES_HEAD.format(name=_xml_attr(a.name), w=comp_w, h=comp_h) + "".join(screens) + _RES_TAIL
     with open(path, "w", encoding="utf-8") as fh:
         fh.write(xml)
+    return summary
 
 
-def _range(name, value, lo, hi, default=None, phase=None, t="DOUBLE"):
+def line_runs(ordered, found, patches, xy, tolerance: float, channels: int, comp_w: float) -> list[list[int]]:
+    """Group pixels into runs that one 1xN line fixture can cover.
+
+    A run is pixels with back-to-back DMX channels in one universe whose canvas
+    positions sit within `tolerance` px of evenly spaced points on a straight line,
+    which is what Resolume samples for a 1xN fixture. tolerance 0 = one slice per pixel.
+    """
+    runs: list[list[int]] = []
+    cur: list[int] = []
+    for k in ordered:
+        if cur and tolerance > 0:
+            prev = patches[found[cur[-1]]["pixel"]]
+            pp = patches[found[k]["pixel"]]
+            joins = (
+                pp.universe == prev.universe
+                and pp.channel == prev.channel + channels
+                and abs(xy[k][0] - xy[cur[-1]][0]) < comp_w / 2  # never across the unwrap seam
+            )
+            if joins:
+                cand = cur + [k]
+                pts = xy[cand]
+                t = np.linspace(0.0, 1.0, len(cand))[:, None]
+                pred = pts[0] + (pts[-1] - pts[0]) * t
+                if float(np.linalg.norm(pred - pts, axis=1).max()) <= tolerance:
+                    cur = cand
+                    continue
+        if cur:
+            runs.append(cur)
+        cur = [k]
+    if cur:
+        runs.append(cur)
+    return runs
+
+
+def _run_rect(pts: np.ndarray, width: float) -> tuple[list[tuple[float, float]], float]:
+    """Corners (Resolume order) and rotation of the input rect for a 1xN fixture along pts.
+
+    Resolume splits the rect's height into N cells, first pixel at the v0/v1 end, and
+    stores the rotation in radians plus the rotated corners (from a saved 7.24.3 preset).
+    """
+    n = len(pts)
+    width = max(width, 1.0)
+    if n == 1:
+        d, length = np.array([0.0, 1.0]), width
+    else:
+        span = pts[-1] - pts[0]
+        dist = float(np.linalg.norm(span))
+        d = span / max(dist, 1e-9)
+        length = max(dist * n / (n - 1), width)  # cell centres land on the first and last pixel
+    angle = math.atan2(-d[0], d[1])  # height axis (-sin, cos) points along the run
+    ex = np.array([math.cos(angle), math.sin(angle)])
+    ey = np.array([-math.sin(angle), math.cos(angle)])
+    c = (pts[0] + pts[-1]) / 2
+    hw, hl = width / 2, length / 2
+    corners = [c - hw * ex - hl * ey, c + hw * ex - hl * ey, c + hw * ex + hl * ey, c - hw * ex + hl * ey]
+    return [(float(p[0]), float(p[1])) for p in corners], angle
+
+
+def artnet_label(universe: int) -> str:
+    return f"{universe >> 8}.{(universe >> 4) & 0xF}.{universe & 0xF}"
+
+
+def _num(v: float, digits: int = 3) -> str:
+    out = f"{v:.{digits}f}".rstrip("0").rstrip(".")
+    return "0" if out in ("-0", "") else out
+
+
+def _xml_attr(text: str) -> str:
+    return str(text).replace("&", "&amp;").replace('"', "&quot;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _range(name, value, lo, hi, default=None, t="DOUBLE"):
     default = value if default is None else default
-    phase = 0 if phase is None else phase
     return (
         f'<ParamRange name="{name}" T="{t}" default="{default}" value="{value}">'
-        f'<PhaseSourceStatic name="PhaseSourceStatic" phase="{phase}"/><BehaviourDouble name="BehaviourDouble"/>'
+        '<PhaseSourceStatic name="PhaseSourceStatic"/><BehaviourDouble name="BehaviourDouble"/>'
         f'<ValueRange name="defaultRange" min="{lo}" max="{hi}"/><ValueRange name="minMax" min="{lo}" max="{hi}"/>'
         f'<ValueRange name="startStop" min="{lo}" max="{hi}"/></ParamRange>'
     )
 
 
-_RES_ADJ = "".join(_range(n, 0, -1, 1, phase=0.5) for n in ("Brightness", "Contrast", "Red", "Green", "Blue"))
+def _guide(kind: int) -> str:
+    return (
+        f'<ScreenGuide name="ScreenGuide" type="{kind}"><Params name="Params"><ParamPixels name="Image"/>'
+        + _range("Opacity", 0.25, 0, 1)
+        + "</Params></ScreenGuide>"
+    )
 
-# Element layout copied from Advanced Output presets saved by Arena 7.13 - 7.26.
+
+_RES_ADJ = "".join(_range(n, 0, -1, 1) for n in ("Brightness", "Contrast", "Red", "Green", "Blue"))
+
+# Element layout follows an Advanced Output preset saved by Arena 7.24.3 (one RGBW pixel fixture).
 _RES_HEAD = (
     '<?xml version="1.0" encoding="utf-8"?>\n'
     '<XmlState name="{name}">\n'
-    '<versionInfo name="Resolume Arena" majorVersion="7" minorVersion="18" microVersion="2" revision="29742"/>\n'
+    '<versionInfo name="Resolume Arena" majorVersion="7" minorVersion="24" microVersion="3" revision="63742"/>\n'
     '<ScreenSetup name="ScreenSetup">\n<Params name="ScreenSetupParams"/>\n'
     '<CurrentCompositionTextureSize width="{w}" height="{h}"/>\n<screens>\n'
-    '<DmxScreen name="{lumi}" uniqueId="{uid}" LumiverseId="0">\n'
-    '<Params name="Params"><Param name="Name" T="STRING" default="" value="{lumi}"/>'
+)
+
+_RES_SCREEN_HEAD = (
+    '<DmxScreen name="{name}" uniqueId="{uid}" LumiverseId="{lumi}">\n'
+    '<Params name="Params"><Param name="Name" T="STRING" default="" value="{name}"/>'
     '<Param name="Enabled" T="BOOL" default="1" value="1"/><Param name="Hidden" T="BOOL" default="0" value="0"/>'
     '<Param name="Auto Span" T="BOOL" default="1" value="1"/><Param name="Align Output" T="BOOL" default="1" value="1"/></Params>\n'
-    '<Params name="Output">' + _range("Opacity", 1, 0, 1, phase=1) + _RES_ADJ + "</Params>\n<layers>\n"
+    '<Params name="Output">'
+    + _range("Opacity", 1, 0, 1)
+    + _RES_ADJ
+    + "</Params>\n<guides>"
+    + _guide(0)
+    + _guide(1)
+    + "</guides>\n<layers>\n"
 )
 
 _RES_SLICE = (
@@ -1008,34 +1357,64 @@ _RES_SLICE = (
     '<Param name="Enabled" T="BOOL" default="1" value="1"/></Params>'
     '<Params name="Input"><ParamChoice name="Input Source" default="0:1" value="0:1" storeChoices="0"/>'
     '<Param name="Input Opacity" T="BOOL" default="1" value="1"/><Param name="Input Bypass/Solo" T="BOOL" default="1" value="1"/>'
-    '<ParamChoice name="Fixture" T="STRING" default="" value="{fixture_uuid}" storeChoices="0"/>'
-    '<ParamRange name="Start Channel" T="DOUBLE" default="1" value="{start}"><PhaseSourceStatic name="PhaseSourceStatic" phase="{start_phase}"/>'
-    '<BehaviourDouble name="BehaviourDouble"/><ValueRange name="defaultRange" min="1" max="131072"/>'
-    '<ValueRange name="minMax" min="1" max="131072"/><ValueRange name="startStop" min="1" max="131072"/></ParamRange>'
-    '<ParamChoice name="Filter Mode" T="INT32" default="0" value="0" storeChoices="0"/></Params>'
+    '<ParamChoice name="Fixture" T="STRING" default="" value="{fixture_id}" storeChoices="0"/>'
+    + _range("Start Channel", "{start}", 1, 131072, default=1)
+    + '<ParamChoice name="Filter Mode" T="INT32" default="0" value="0" storeChoices="0"/></Params>'
     '<Params name="Output"><Param name="Flip" T="UINT8" default="0" value="0"/>' + _RES_ADJ + "</Params>"
-    '<InputRect orientation="0"><v x="{x0}" y="{y0}"/><v x="{x1}" y="{y0}"/><v x="{x1}" y="{y1}"/><v x="{x0}" y="{y1}"/></InputRect>'
+    '<InputRect orientation="{orientation}">{v}</InputRect>'
     '<OutputRect orientation="0"><v x="-0.5" y="-0.5"/><v x="0.5" y="-0.5"/><v x="0.5" y="0.5"/><v x="-0.5" y="0.5"/></OutputRect>'
-    '<FixtureInstance name="FixtureInstance"><Fixture name="Fixture" uuid="{fixture_uuid}" fixtureName="Twinkly pixel">'
+    '<FixtureInstance name="FixtureInstance"><Fixture name="Fixture" uuid="{instance}" fixtureName="">'
     '<Params name="Params"><ParamFixturePixels storage="0" name="Pixels">'
-    + _range("Width", 1, 1, 512, default=1, phase=0)
-    + _range("Height", 1, 1, 512, default=1, phase=0)
+    + _range("Width", 1, 1, 512)
+    + _range("Height", "{height}", 1, 512, default=1)
     + '<ParamChoice name="Color Format" T="STRING" default="rgb" value="{color}" storeChoices="0"/>'
     '<ParamChoice name="Distribution" T="INT32" default="170" value="170" storeChoices="0"/>'
-    + _range("Gamma", 2.5, 1, 3, default=2.5, phase=0.75)
+    + _range("Gamma", 2.5, 1, 3)
     + "</ParamFixturePixels></Params></Fixture></FixtureInstance></DmxSlice>\n"
 )
 
-_RES_TAIL = (
+# The same slice without the parameters that only repeat Resolume's defaults (the
+# per-slice colour adjustments, opacity/bypass toggles, filter mode). Smaller, but
+# Arena 7.24.3 loads it the same as the full form (checked 2026-11-11); --resolume-full writes the long form.
+_RES_SLICE_COMPACT = (
+    '<DmxSlice uniqueId="{uid}">'
+    '<Params name="Common"><Param name="Name" T="STRING" default="Layer" value="{name}"/></Params>'
+    '<Params name="Input">'
+    '<ParamChoice name="Fixture" T="STRING" default="" value="{fixture_id}" storeChoices="0"/>'
+    '<ParamRange name="Start Channel" T="DOUBLE" default="1" value="{start}"/>'
+    "</Params>"
+    '<InputRect orientation="{orientation}">{v}</InputRect>'
+    '<OutputRect orientation="0"><v x="-0.5" y="-0.5"/><v x="0.5" y="-0.5"/><v x="0.5" y="0.5"/><v x="-0.5" y="0.5"/></OutputRect>'
+    '<FixtureInstance name="FixtureInstance"><Fixture name="Fixture" uuid="{instance}" fixtureName="">'
+    '<Params name="Params"><ParamFixturePixels storage="0" name="Pixels">'
+    '<ParamRange name="Width" T="DOUBLE" default="1" value="1"/>'
+    '<ParamRange name="Height" T="DOUBLE" default="1" value="{height}"/>'
+    '<ParamChoice name="Color Format" T="STRING" default="rgb" value="{color}" storeChoices="0"/>'
+    "</ParamFixturePixels></Params></Fixture></FixtureInstance></DmxSlice>\n"
+)
+
+_RES_SCREEN_TAIL = (
     "</layers>\n<OutputDevice>"
-    '<OutputDeviceDmx name="Lumiverse" deviceId="Lumiverse"><Params name="Params">'
-    + _range("Framerate", 40, 1, 40, default=30, phase=1)
-    + _range("Delay", 0, 0, 150, default=40, phase=0)
+    '<OutputDeviceDmx name="Lumiverse" deviceId="Lumiverse" idHash="6362816615335067648"><Params name="Params">'
+    + _range("Framerate", "{fps}", 1, 40, default=30)
+    + _range("Delay", 0, 0, 150, default=40)
     + '<ParamChoice name="Dmx Interface" T="INT32" default="0" value="0" storeChoices="0"/></Params>'
     '<DmxOutputParams name="Params"><Param name="TargetIP" default="TT_DISABLED" value="{target}"/>'
     + _range("Subnet", "{subnet}", 0, 15, default=0)
     + _range("Universe", "{universe}", 0, 15, default=0)
-    + "</DmxOutputParams></OutputDeviceDmx></OutputDevice>\n</DmxScreen>\n</screens>\n</ScreenSetup>\n</XmlState>\n"
+    + "</DmxOutputParams></OutputDeviceDmx></OutputDevice>\n</DmxScreen>\n"
+)
+
+_RES_TAIL = (
+    "</screens>\n"
+    '<SoftEdging><Params name="Soft Edge">'
+    + _range("Gamma Red", 2, 1, 3)
+    + _range("Gamma Green", 2, 1, 3)
+    + _range("Gamma Blue", 2, 1, 3)
+    + _range("Gamma", 1, 0, 1)
+    + _range("Luminance", 0.5, 0, 1)
+    + _range("Power", 2, 0.1, 7)
+    + "</Params></SoftEdging>\n</ScreenSetup>\n</XmlState>\n"
 )
 
 
@@ -1045,19 +1424,40 @@ def cmd_export(a) -> int:
     if not found:
         raise SystemExit("map has no pixels")
     dims = m.get("dims", 2)
-    patch = patch_for(a, m["pixels"])
+    patches = pixel_patches(a, m["pixels"])
+    unpatched = [f for f in found if f["pixel"] not in patches]
+    found = [f for f in found if f["pixel"] in patches]
+    if unpatched:
+        print(f"skipping {len(unpatched)} found pixels that no universe carries (past a controller's patched count)")
+    if not found:
+        raise SystemExit("none of the found pixels are patched to a universe")
     if a.madrix:
         cells, nudged = grid_positions(found, a.grid, dims)
-        write_madrix(a.madrix, found, cells, patch, a)
+        write_madrix(a.madrix, found, cells, patches, a)
         ext = [max(c[i] for c in cells) + 1 for i in range(len(cells[0]))]
         print(
             f"MADRIX: {len(found)} fixtures on a {' x '.join(map(str, ext))} grid ({nudged} nudged off a shared cell)"
             f" -> {a.madrix}"
         )
-    if a.resolume:
-        write_resolume(a.resolume, found, patch, a, dims)
-        print(f"Resolume: {len(found)} pixel slices on {a.comp[0]}x{a.comp[1]} -> {a.resolume}")
-    if not (a.madrix or a.resolume):
+    if a.resolume or a.preview:
+        xy, sizes, layout = canvas_layout(found, dims, tuple(a.comp), a.layout)
+        if a.resolume:
+            lumis = write_resolume(a.resolume, found, patches, xy, sizes, a)
+            n_slices = sum(lu["slices"] for lu in lumis)
+            print(
+                f"Resolume: {len(found)} pixels in {n_slices} slices on {a.comp[0]}x{a.comp[1]}"
+                f" ({layout} layout) -> {a.resolume}"
+            )
+            for lu in lumis:
+                feed = f" via {lu['feed']}" if lu["feed"] else ""
+                print(
+                    f"  {lu['name']}: {lu['pixels']} px, Art-Net {lu['first']} - {lu['last']}{feed}"
+                    f" (Resolume output Sub-Net {lu['resolume_subnet']} Universe {lu['resolume_universe']})"
+                )
+        if a.preview:
+            keys = [patches[f["pixel"]].group for f in found]
+            preview_canvas(a.preview, xy, sizes, keys, tuple(a.comp))
+    if not (a.madrix or a.resolume or a.preview):
         print("nothing to do: add --madrix FILE and/or --resolume FILE")
     return 0
 
@@ -1173,7 +1573,7 @@ def main(argv=None) -> int:
     d.add_argument("--pixels", type=int, required=True, help="pixel count the scan ran with (twinkly_probe prints it)")
     d.add_argument("--slot", type=float, default=mapcode.DEFAULT_SLOT, help="seconds per slot the scan ran with")
     d.add_argument("--out", default="pixelmap-out", help="output folder")
-    d.add_argument("--max-width", type=int, default=1280, help="decode at this width (default 1280)")
+    d.add_argument("--max-width", type=int, default=1280, help="decode with the long side at most this (default 1280)")
     d.add_argument("--min-contrast", type=float, default=20.0, help="minimum on-minus-off brightness (0-255)")
     d.add_argument("--min-margin", type=float, default=0.3, help="how clear every bit must be (0-1)")
 
@@ -1187,6 +1587,12 @@ def main(argv=None) -> int:
     s3.add_argument("--fix-fov", action="store_true", help="trust --fov instead of refining it (3+ views)")
     s3.add_argument(
         "--scale", nargs=3, metavar=("PIXEL_A", "PIXEL_B", "METERS"), help="known distance between two pixels"
+    )
+    s3.add_argument(
+        "--max-points",
+        type=int,
+        default=2500,
+        help="place the cameras with at most this many pixels, then triangulate all (0 = use every pixel)",
     )
 
     e = sub.add_parser("export", help="pixel positions -> MADRIX CSV / Resolume XML")
@@ -1207,8 +1613,41 @@ def main(argv=None) -> int:
     e.add_argument(
         "--comp", type=int, nargs=2, default=(1920, 1080), metavar=("W", "H"), help="Resolume composition size"
     )
+    e.add_argument("--rig", help="rig manifest (rig.json) from a whole-rig scan: patch every controller from it")
+    e.add_argument(
+        "--layout",
+        choices=("auto", "front", "cylinder"),
+        default="auto",
+        help="composition layout: cylinder = 3D map unwrapped around the trunk (auto: cylinder for 3D, front for 2D)",
+    )
+    e.add_argument("--preview", help="write a PNG of the composition with every sample square")
     e.add_argument("--resolume-color", default="rgbw", help="Resolume fixture Color Format value (rgb, rgbw)")
-    e.add_argument("--resolume-target", default="TT_BROADCAST", help="Lumiverse TargetIP value")
+    e.add_argument(
+        "--resolume-target",
+        default="TT_DISABLED",
+        help="Lumiverse TargetIP value (set the real target per lumiverse in Resolume)",
+    )
+    e.add_argument(
+        "--resolume-fixture-id",
+        default="986f95a7626546a380bd7f131a03189c",
+        help="the Fixture choice each slice points at (from a saved one-pixel preset)",
+    )
+    e.add_argument("--resolume-fps", type=int, default=30, help="Lumiverse output frame rate (1-40)")
+    e.add_argument(
+        "--line-tolerance",
+        type=float,
+        default=1.5,
+        help="merge back-to-back pixels into 1xN line slices when they sit within this many composition px"
+        " of a straight, evenly spaced line (0 = one slice per pixel)",
+    )
+    e.add_argument(
+        "--resolume-full",
+        dest="resolume_compact",
+        action="store_false",
+        help="write every per-slice parameter (default: leave out the ones that only repeat Resolume's defaults,"
+        " which Arena 7.24.3 loads the same)",
+    )
+    e.add_argument("--resolume-compact", dest="resolume_compact", action="store_true", help=argparse.SUPPRESS)
 
     sy = sub.add_parser("synth", help="render a fake scan video for testing")
     sy.add_argument("video")

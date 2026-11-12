@@ -258,6 +258,36 @@ disk has less than `mapping.min_free_mb` (500 MB) left, and every clip has a
 delete button. Decoding needs numpy, OpenCV and scipy on the bridge box;
 `deploy/install.sh` installs them (`TWINKLY_BRIDGE_MAPPING=0` skips that).
 
+**The whole rig at once (big tree).** Pick **🎄 All controllers** at the top of
+the controller list and tap **Start scan**. Every ready controller blinks at the
+same time, and every pixel gets its own number across the whole rig (25 x 1440
+pixels = 20-bit codes, about 22 s per pass). Controllers that are offline or
+still in a group are left out, and the page lists them. Film the tree from 6 to
+8 tripod spots all the way round, about 45 degrees apart, and upload one clip per
+spot. Clips taken against the same scan numbering solve together, so a later
+scan with the same controllers is fine. Then **Solve 3D** and download:
+
+- **Resolume XML**: the 3D map unwrapped around the trunk onto the composition
+  (`mapping.comp_width` x `comp_height`, default 1920x1080). Left to right goes
+  around the tree, with the front (first clip's side) in the middle and the seam
+  at the back. Top to bottom is height. There's one Lumiverse per Art-Net net
+  (0.x.x is Lumiverse 1, 1.x.x is Lumiverse 2, and a `listen_ip` split also gets
+  its own lumiverse), since Resolume addresses 256 universes per output. Each
+  lumiverse starts at the Sub-Net/Universe of its first universe. Set each
+  lumiverse's target IP in Resolume after loading the preset. Back-to-back
+  pixels that sit on a straight, evenly spaced line within 1.5 px become one
+  rotated 1xN line slice (`--line-tolerance`, 0 = one slice per pixel), named
+  like `Tree 7 120-131`. On a 36,000-pixel test tree that is about 4,000 slices
+  and 17 MB; slices leave out the per-slice default parameters, which
+  makes it about 4.5 MB (Arena 7.24.3 loads it the same; `--resolume-full`
+  writes the long form).
+- **Canvas preview**: a PNG of the composition with every sample square,
+  coloured by lumiverse, to check the unwrap before loading it.
+
+A whole-rig clip is decoded at 1920 px wide (single controllers use
+`mapping.decode_width`), so film at 1080p or 4K. The solver places the cameras
+from 2500 of the pixels and then triangulates all of them (`--max-points`).
+
 The rest of this section is the same thing by hand.
 
 **How the code works.** Each pixel blinks its own number: the Gray code of its
@@ -315,6 +345,10 @@ bracket the code and set the timing. One pass takes about 18 s.
      (Advanced Output > preset menu > Reveal) and load it. One Lumiverse, one 1x1
      pixel slice per pixel, Auto Span on, so 128 RGBW pixels fill each
      universe like the bridge expects. `--comp W H` must match your composition.
+     `--layout cylinder` (the default for a 3D map) unwraps around the trunk;
+     `--layout front` keeps the front view. `--rig rig.json` patches a whole-rig
+     map from its scan manifest instead of `--bridge-config`, and `--preview
+     canvas.png` draws the layout.
 
 Test the whole chain with no gear: `python3 tools/pixelmap.py synth fake.mp4
 --pixels 300`, decode it, then `python3 tools/pixelmap.py score

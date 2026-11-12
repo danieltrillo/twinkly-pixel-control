@@ -7,6 +7,12 @@ Everything lives under one directory (config `mapping.dir`):
     <device>/<job-id>/map.json      the decoder's results (plus map.csv, preview.png, log.txt)
     <device>/solve/                 the 3D solve over every decoded clip of that device
     <device>/export/                MADRIX / Resolume files, rebuilt on every download
+    _rig/rig.json                   the last whole-rig scan: rig-wide pixel numbers per controller
+    _rig/<job-id>/rig.json          the scan a clip was filmed against (each rig job keeps its own copy)
+
+A whole-rig scan (device "*") blinks every controller at once with one pixel
+numbering across the rig, so a clip of the whole tree decodes every controller
+in one go and the export patches each pixel from the manifest.
 
 Decoding runs `python -m twinklybridge.mapping` in a niced subprocess, one job at
 a time, so a long decode never stalls the frames the bridge is streaming.
@@ -32,9 +38,13 @@ MB = 1024 * 1024
 SAFE_NAME = re.compile(r"[^A-Za-z0-9._-]+")
 ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 VIDEO_EXTS = {".mp4", ".mov", ".m4v", ".webm", ".mkv", ".avi", ".3gp", ".mts", ".hevc"}
-RESULT_FILES = ("map.json", "map.csv", "preview.png", "log.txt")
-EXPORT_KINDS = {"madrix.csv": "--madrix", "resolume.xml": "--resolume"}
+RESULT_FILES = ("map.json", "map.csv", "preview.png", "log.txt", "rig.json")
+EXPORT_KINDS = {"madrix.csv": "--madrix", "resolume.xml": "--resolume", "canvas.png": "--preview"}
 SOLVE_ID = "solve"
+RIG = "*"  # the device name for a whole-rig scan
+RIG_SLUG = "_rig"  # slug() strips leading underscores, so no controller can land here
+RIG_FILE = "rig.json"
+RIG_DECODE_WIDTH = 1920  # a whole tree packs many pixels into the frame: decode with more detail
 CHUNK = 1 << 20
 
 
@@ -43,6 +53,8 @@ class StoreError(Exception):
 
 
 def slug(name: str) -> str:
+    if name == RIG:
+        return RIG_SLUG
     return SAFE_NAME.sub("_", str(name)).strip("._")[:48] or "device"
 
 
@@ -61,6 +73,13 @@ def _read_json(path: str) -> dict | None:
             return json.load(fh)
     except (OSError, ValueError):
         return None
+
+
+def rig_key(rig: dict | None) -> str:
+    """Two scans with the same key number the pixels the same way, so their clips solve together."""
+    if not rig:
+        return ""
+    return json.dumps([[d["name"], d["offset"], d["pixels"]] for d in rig.get("devices", [])])
 
 
 def _write_json(path: str, data: dict) -> None:
@@ -138,7 +157,21 @@ class MapStore:
     def note_scan(self, device: str, pixels: int, slot: float) -> None:
         self.scan_settings[device] = {"pixels": int(pixels), "slot": float(slot), "at": time.time()}
 
+    def note_rig_scan(self, manifest: dict) -> None:
+        os.makedirs(self.device_dir(RIG_SLUG), exist_ok=True)
+        _write_json(os.path.join(self.device_dir(RIG_SLUG), RIG_FILE), manifest)
+        self.note_scan(RIG, manifest["total"], manifest["slot"])
+
+    def rig_manifest(self) -> dict | None:
+        """The last whole-rig scan (kept on disk, so it survives a restart)."""
+        return _read_json(os.path.join(self.device_dir(RIG_SLUG), RIG_FILE))
+
     def settings_for(self, device: str, fallback_pixels: int) -> dict:
+        if device == RIG:
+            rig = self.rig_manifest()
+            if not rig:
+                raise StoreError("run a whole-rig scan first: the clip is decoded against that scan's numbering")
+            return {"pixels": int(rig["total"]), "slot": float(rig["slot"])}
         s = self.scan_settings.get(device)
         if s:
             return {"pixels": s["pixels"], "slot": s["slot"]}
@@ -253,6 +286,13 @@ class MapStore:
             "result": None,
             "error": "",
         }
+        if device == RIG:
+            rig = self.rig_manifest()
+            if not rig:
+                os.rmdir(jdir)
+                raise StoreError("run a whole-rig scan first: the clip is decoded against that scan's numbering")
+            _write_json(os.path.join(jdir, RIG_FILE), rig)
+            job["rig"] = {"controllers": len(rig["devices"]), "key": rig_key(rig), "scan": rig.get("created")}
         self._update(job)
         limit = self.cfg.max_upload_mb * MB
         size = 0
@@ -300,6 +340,10 @@ class MapStore:
         if self._queue is None:
             raise StoreError("the mapping store is not running")
         clips = [j for j in self.jobs(device) if j["type"] == "decode" and j["status"] == "done"]
+        if device == RIG and clips:
+            # only clips filmed against the same numbering (the newest clip's) solve together
+            key = (clips[-1].get("rig") or {}).get("key")
+            clips = [j for j in clips if (j.get("rig") or {}).get("key") == key]
         if len(clips) < 2:
             raise StoreError("3D needs at least two decoded clips from different angles (6-8 is better)")
         device_slug = slug(device)
@@ -310,6 +354,10 @@ class MapStore:
                 os.remove(os.path.join(sdir, f))
             except OSError:
                 pass
+        if device == RIG:
+            shutil.copyfile(
+                os.path.join(self.job_dir(device_slug, clips[-1]["id"]), RIG_FILE), os.path.join(sdir, RIG_FILE)
+            )
         job = {
             "id": SOLVE_ID,
             "slug": device_slug,
@@ -344,18 +392,26 @@ class MapStore:
         out_dir = os.path.join(self.device_dir(device_slug), "export")
         os.makedirs(out_dir, exist_ok=True)
         out = os.path.join(out_dir, f"{source}-{kind}")
-        cmd = [
-            "export",
-            src,
-            "--bridge-config",
-            self.config_path,
-            "--device",
-            job["device"],
-            "--name",
-            job["device"],
-            flag,
-            out,
-        ]
+        if job["device"] == RIG:
+            rig = os.path.join(src_dir, RIG_FILE)
+            if not os.path.isfile(rig):
+                raise StoreError("this result has no rig manifest; decode a clip from a whole-rig scan")
+            cmd = ["export", src, "--rig", rig, "--name", "Twinkly rig", flag, out]
+        else:
+            cmd = [
+                "export",
+                src,
+                "--bridge-config",
+                self.config_path,
+                "--device",
+                job["device"],
+                "--name",
+                job["device"],
+                flag,
+                out,
+            ]
+        if kind != "madrix.csv":
+            cmd += ["--comp", str(self.cfg.comp_width), str(self.cfg.comp_height)]
         rc, text, _ = await self._run_mapping(None, cmd)
         if rc != 0 or not os.path.isfile(out):
             raise StoreError(f"export failed: {_last_line(text)}")
@@ -406,7 +462,7 @@ class MapStore:
             "--out",
             jdir,
             "--max-width",
-            str(self.cfg.decode_width),
+            str(max(self.cfg.decode_width, RIG_DECODE_WIDTH) if job.get("device") == RIG else self.cfg.decode_width),
         ]
         rc, text, seconds = await self._run_mapping(job, cmd)
         if not os.path.isdir(jdir):

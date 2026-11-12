@@ -132,6 +132,8 @@ class MappingConfig:
     color: str = "white"  # white (W chip) | rgb | green
     passes: int = 10  # how often the code repeats per scan (about 18 s each)
     decode_width: int = 1280  # decode videos at this width
+    comp_width: int = 1920  # Resolume composition the export lays the pixels out on
+    comp_height: int = 1080
 
 
 @dataclass
@@ -452,6 +454,8 @@ MAPPING_KEYS = {
     "color",
     "passes",
     "decode_width",
+    "comp_width",
+    "comp_height",
 }
 
 
@@ -506,6 +510,8 @@ def parse_config(raw: Any) -> Config:
         color=_choice(map_raw.get("color"), "mapping.color", MAP_COLORS, "white"),
         passes=_int(map_raw.get("passes"), "mapping.passes", 10, 1, 100),
         decode_width=_int(map_raw.get("decode_width"), "mapping.decode_width", 1280, 320, 4096),
+        comp_width=_int(map_raw.get("comp_width"), "mapping.comp_width", 1920, 64, 16384),
+        comp_height=_int(map_raw.get("comp_height"), "mapping.comp_height", 1080, 64, 16384),
     )
     return Config(
         input=inp,

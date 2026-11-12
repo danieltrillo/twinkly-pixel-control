@@ -102,6 +102,9 @@ class ScanJob:
     brightness: int
     color: str
     stopped: bool = False
+    rig: bool = False  # part of a whole-rig scan (every controller blinks at once)
+    offset: int = 0  # first rig-wide pixel number on this controller
+    total: int = 0  # pixels in the whole scan (this controller's own count for a solo scan)
 
     @property
     def pass_seconds(self) -> float:
@@ -129,14 +132,25 @@ class ScanJob:
             "remaining": round(max(0.0, self.total_seconds - t), 1),
             "pass_seconds": round(self.pass_seconds, 1),
             "pixels": self.pixels,
+            "rig": self.rig,
+            "offset": self.offset,
+            "total": self.total or self.pixels,
             "slot": self.slot,
             "brightness": self.brightness,
             "color": self.color,
         }
 
 
-def render_scan_frames(pixels: int, order: str, brightness: int, color: str) -> list[bytes]:
-    """One wire-order frame per slot of the blink code."""
+def render_scan_frames(
+    pixels: int, order: str, brightness: int, color: str, offset: int = 0, total: int = 0
+) -> list[bytes]:
+    """One wire-order frame per slot of the blink code.
+
+    For a whole-rig scan every controller shows the code of the whole rig: this
+    controller's pixels are rig-wide numbers offset .. offset+pixels-1 out of total,
+    and every controller runs the same schedule, so all of them blink in step.
+    """
+    total = max(total, offset + pixels)
     v = max(1, min(int(brightness), 255))
     order = order.upper()
     if color == "white" and "W" in order:
@@ -147,12 +161,71 @@ def render_scan_frames(pixels: int, order: str, brightness: int, color: str) -> 
         lit_rgbw = {"R": v, "G": v, "B": v, "W": 0}
     lit = bytes(lit_rgbw[ch] for ch in order)
     black = bytes(len(order))
-    words = [mapcode.codeword(i, pixels) for i in range(pixels)]
+    words = [mapcode.codeword(offset + i, total) for i in range(pixels)]
     frames = []
-    for slot in mapcode.schedule(pixels):
+    for slot in mapcode.schedule(total):
         mask = mapcode.lit_mask(slot, pixels, words)
         frames.append(b"".join(lit if on else black for on in mask))
     return frames
+
+
+def start_rig_scan(devices: list, *, slot: float, brightness: int, color: str, repeat: int) -> dict:
+    """Blink every ready controller at once, numbering pixels across the whole rig.
+
+    Controllers that can't scan (offline, group slave) are left out and listed.
+    Returns the rig manifest: which rig-wide pixel numbers each controller got and
+    the universes its pixels arrive on, which is what the export needs later.
+    """
+    ready, skipped = [], []
+    for dev in devices:
+        if not dev.cfg.enabled:
+            continue
+        try:
+            dev.check_scannable()
+        except ScanError as exc:
+            skipped.append({"name": dev.name, "ip": dev.cfg.ip, "reason": str(exc)})
+            continue
+        ready.append(dev)
+    if not ready:
+        raise ScanError("no controller is ready to scan")
+    entries, offset = [], 0
+    for dev in ready:
+        n = dev.out_pixels
+        entries.append((dev, offset, n))
+        offset += n
+    total = offset
+    started = ready[0].clock() + 0.3  # rendering takes a moment; start everyone on the same slot
+    manifest_devices = []
+    for dev, off, n in entries:
+        dev.start_scan(
+            slot=slot, brightness=brightness, color=color, repeat=repeat, offset=off, total=total, started=started
+        )
+        manifest_devices.append(
+            {
+                "name": dev.name,
+                "ip": dev.cfg.ip,
+                "offset": off,
+                "pixels": n,
+                "protocol": dev.cfg.protocol,
+                "channels": dev.cfg.channels,
+                "feed": dev.cfg.listen_ip,  # "" = the main input; else its own lumiverse(s)
+                "segments": [
+                    {"universe": sg.universe, "channel": sg.channel, "first_pixel": sg.first_pixel, "count": sg.count}
+                    for sg in dev.cfg.segments
+                ],
+            }
+        )
+    log.info("whole-rig mapping scan started: %d controllers, %d pixels, %d skipped", len(ready), total, len(skipped))
+    return {
+        "kind": "twinkly-rig",
+        "version": 1,
+        "created": time.time(),
+        "total": total,
+        "slot": float(slot),
+        "pass_seconds": round(ready[0].scan.pass_seconds, 1),
+        "devices": manifest_devices,
+        "skipped": skipped,
+    }
 
 
 # --------------------------------------------------------------------------
@@ -255,22 +328,43 @@ class DeviceRunner:
     def scanning(self, now: float) -> bool:
         return self.scan is not None and not self.scan.done(now)
 
-    def start_scan(self, *, slot: float, brightness: int, color: str, repeat: int) -> ScanJob:
-        """Show the blink code on this device for `repeat` passes (replaces the input meanwhile)."""
+    def check_scannable(self) -> None:
         if not self._ready or self.client is None or not self.order:
             raise ScanError(f"{self.name} is {self.state}; it has to be online first")
         if self.info is not None and self.info.group_mode == "slave":
             raise ScanError(f"{self.name} is a group slave; take it out of its group in the Twinkly app first")
+
+    def start_scan(
+        self,
+        *,
+        slot: float,
+        brightness: int,
+        color: str,
+        repeat: int,
+        offset: int = 0,
+        total: int = 0,
+        started: float | None = None,
+    ) -> ScanJob:
+        """Show the blink code on this device for `repeat` passes (replaces the input meanwhile).
+
+        offset/total/started make it one controller of a whole-rig scan (see start_rig_scan).
+        """
+        self.check_scannable()
         pixels = self.out_pixels
-        frames = render_scan_frames(pixels, self.order, brightness, color)
+        rig = total > 0
+        total = max(total, offset + pixels) if rig else pixels
+        frames = render_scan_frames(pixels, self.order, brightness, color, offset, total)
         self.scan = ScanJob(
             frames=frames,
             slot=float(slot),
             repeat=max(1, int(repeat)),
-            started=self.clock(),
+            started=self.clock() if started is None else started,
             pixels=pixels,
             brightness=max(1, min(int(brightness), 255)),
             color=color,
+            rig=rig,
+            offset=offset,
+            total=total,
         )
         log.info(
             "%s: mapping scan started, %d pixels, %d pass(es) of %.0f s",
