@@ -71,11 +71,12 @@ def _gray(frame: np.ndarray) -> np.ndarray:
 
 
 def _resize(img: np.ndarray, max_width: int) -> np.ndarray:
+    """Shrink so the long side is at most max_width (portrait clips cost the same memory as landscape)."""
     h, w = img.shape[:2]
-    if w <= max_width:
+    if max(w, h) <= max_width:
         return img
-    scale = max_width / w
-    return cv2.resize(img, (max_width, round(h * scale)), interpolation=cv2.INTER_AREA)
+    scale = max_width / max(w, h)
+    return cv2.resize(img, (round(w * scale), round(h * scale)), interpolation=cv2.INTER_AREA)
 
 
 def read_trace(path: str, small_width: int = 160) -> tuple[np.ndarray, np.ndarray, float, tuple[int, int]]:
@@ -1486,7 +1487,7 @@ def main(argv=None) -> int:
     d.add_argument("--pixels", type=int, required=True, help="pixel count the scan ran with (twinkly_probe prints it)")
     d.add_argument("--slot", type=float, default=mapcode.DEFAULT_SLOT, help="seconds per slot the scan ran with")
     d.add_argument("--out", default="pixelmap-out", help="output folder")
-    d.add_argument("--max-width", type=int, default=1280, help="decode at this width (default 1280)")
+    d.add_argument("--max-width", type=int, default=1280, help="decode with the long side at most this (default 1280)")
     d.add_argument("--min-contrast", type=float, default=20.0, help="minimum on-minus-off brightness (0-255)")
     d.add_argument("--min-margin", type=float, default=0.3, help="how clear every bit must be (0-1)")
 
