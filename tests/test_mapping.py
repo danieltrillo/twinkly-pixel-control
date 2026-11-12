@@ -153,7 +153,9 @@ def test_export_madrix_and_resolume(tmp_path):
     m = tmp_path / "map.json"
     m.write_text(json.dumps({"pixels": n, "dims": 2, "found": found}))
     mad, res = tmp_path / "m.csv", tmp_path / "r.xml"
-    pixelmap.main(["export", str(m), "--madrix", str(mad), "--resolume", str(res), "--universe", "0.0.3"])
+    pixelmap.main(
+        ["export", str(m), "--madrix", str(mad), "--resolume", str(res), "--universe", "0.0.3", "--line-tolerance", "0"]
+    )
     rows = list(csv.DictReader(mad.open()))
     assert len(rows) == n
     assert rows[0]["DMX Universe"] == "4" and rows[0]["DMX Channel"] == "1"  # Art-Net 0.0.3 -> MADRIX 4
@@ -238,7 +240,9 @@ def test_export_whole_rig_splits_lumiverses_by_net(tmp_path):
     m = tmp_path / "map.json"
     m.write_text(json.dumps({"pixels": 400, "dims": 3, "found": found}))
     res, png = tmp_path / "r.xml", tmp_path / "canvas.png"
-    pixelmap.main(["export", str(m), "--rig", str(rig), "--resolume", str(res), "--preview", str(png)])
+    pixelmap.main(
+        ["export", str(m), "--rig", str(rig), "--resolume", str(res), "--preview", str(png), "--line-tolerance", "0"]
+    )
     root = ET.parse(res).getroot()
     assert root.find("versionInfo").get("minorVersion") == "24"
     screens = root.findall(".//DmxScreen")
@@ -257,8 +261,9 @@ def test_export_whole_rig_splits_lumiverses_by_net(tmp_path):
     names = [s.find(".//Param[@name='Name']").get("value") for s in b.findall(".//DmxSlice")]
     assert names[0] == "Tree B 1" and names[-1] == "Tree B 150"
     for s in root.iter("InputRect"):
-        for v in s.iter("v"):
-            assert 0 <= float(v.get("x")) <= 1920 and 0 <= float(v.get("y")) <= 1080
+        v = np.array([[float(q.get("x")), float(q.get("y"))] for q in s.iter("v")])
+        c = v.mean(axis=0)  # every pixel's sample square centre sits on the composition
+        assert 0 < c[0] < 1920 and 0 < c[1] < 1080
     assert {p.get("value") for p in root.iter("ParamChoice") if p.get("name") == "Color Format"} == {"rgbw"}
     assert {p.get("value") for p in root.iter("Param") if p.get("name") == "TargetIP"} == {"TT_DISABLED"}
     img = cv2.imread(str(png))
@@ -275,7 +280,10 @@ def test_export_rig_skips_pixels_no_universe_carries(tmp_path):
     m.write_text(json.dumps({"pixels": 10, "dims": 2, "found": found}))
     res = tmp_path / "r.xml"
     pixelmap.main(["export", str(m), "--rig", str(rig), "--resolume", str(res)])
-    assert len(ET.parse(res).getroot().findall(".//DmxSlice")) == 6
+    sl = ET.parse(res).getroot().findall(".//DmxSlice")
+    assert len(sl) == 1  # six pixels in a straight row: one 1x6 line slice
+    assert sl[0].find(".//ParamRange[@name='Height']").get("value") == "6"
+    assert sl[0].find(".//Param[@name='Name']").get("value") == "Tree A 1-6"
 
 
 def test_solve3d_places_cameras_from_a_sample_then_triangulates_everything(tmp_path):
@@ -294,3 +302,56 @@ def test_solve3d_places_cameras_from_a_sample_then_triangulates_everything(tmp_p
     assert len(got["found"]) >= 0.97 * seen_by_two  # all of them, not just the 150
     err, up, _ = _shape_error(got, xyz)
     assert err < 0.02 and up > 0.99
+
+
+def test_run_rect_matches_a_preset_saved_by_arena():
+    # Arena 7.24.3: a 1x10 fixture, 32 x 320 px, rotated 30 degrees about (960, 540)
+    saved = [(1026.142, 393.435), (1053.855, 409.435), (893.858, 686.565), (866.145, 670.565)]
+    ey = np.array([-math.sin(math.pi / 6), math.cos(math.pi / 6)])
+    centres = np.array([960.0, 540.0]) + np.outer((np.arange(10) + 0.5) / 10 * 320 - 160, ey)
+    corners, angle = pixelmap._run_rect(centres, 32.0)
+    assert angle == pytest.approx(0.5235899, abs=1e-4)  # Arena stores a float32
+    for got, want in zip(corners, saved, strict=True):
+        assert got == pytest.approx(want, abs=0.01)
+
+
+def test_line_slices_cover_every_pixel_once(tmp_path):
+    xyz, _ = _cone_tree(400)
+    rig = tmp_path / "rig.json"
+    _rig_manifest(rig, [("Tree A", 0, 400)])
+    found = [{"pixel": i, "x": float(p[0]), "y": float(p[1]), "z": float(p[2])} for i, p in enumerate(xyz)]
+    m = tmp_path / "map.json"
+    m.write_text(json.dumps({"pixels": 400, "dims": 3, "found": found}))
+    res = tmp_path / "r.xml"
+    pixelmap.main(["export", str(m), "--rig", str(rig), "--resolume", str(res), "--line-tolerance", "1.5"])
+    slices = ET.parse(res).getroot().findall(".//DmxSlice")
+    assert len(slices) < 200  # far fewer slices than pixels
+    covered = []
+    for sl in slices:
+        start = float(sl.find(".//ParamRange[@name='Start Channel']").get("value"))
+        n = int(sl.find(".//ParamRange[@name='Height']").get("value"))
+        first = int((start - 1) // 512 * 128 + ((start - 1) % 512) // 4)
+        covered += range(first, first + n)
+    assert sorted(covered) == list(range(400))
+    # where Resolume samples each pixel (cell centres along the rect) vs where the export put it
+    xy, _, _ = pixelmap.canvas_layout(found, 3, (1920, 1080), "cylinder")
+    for sl in slices:
+        v = np.array([[float(q.get("x")), float(q.get("y"))] for q in sl.find("InputRect")])
+        n = int(sl.find(".//ParamRange[@name='Height']").get("value"))
+        start = float(sl.find(".//ParamRange[@name='Start Channel']").get("value"))
+        first = int((start - 1) // 512 * 128 + ((start - 1) % 512) // 4)
+        top, bottom = (v[0] + v[1]) / 2, (v[3] + v[2]) / 2
+        cells = top + np.outer((np.arange(n) + 0.5) / n, bottom - top)
+        assert np.abs(cells - xy[first : first + n]).max() < 1.6
+
+
+def test_compact_slices_are_smaller(tmp_path):
+    found = [{"pixel": i, "x": float(i % 7) * 13, "y": float(i // 7) * 11} for i in range(200)]
+    m = tmp_path / "map.json"
+    m.write_text(json.dumps({"pixels": 200, "dims": 2, "found": found}))
+    full, small = tmp_path / "full.xml", tmp_path / "small.xml"
+    pixelmap.main(["export", str(m), "--resolume", str(full), "--line-tolerance", "0"])
+    pixelmap.main(["export", str(m), "--resolume", str(small), "--line-tolerance", "0", "--resolume-compact"])
+    assert small.stat().st_size < 0.4 * full.stat().st_size
+    root = ET.parse(small).getroot()
+    assert len(root.findall(".//DmxSlice")) == 200

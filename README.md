@@ -274,8 +274,12 @@ scan with the same controllers is fine. Then **Solve 3D** and download:
   (0.x.x is Lumiverse 1, 1.x.x is Lumiverse 2, and a `listen_ip` split also gets
   its own lumiverse), since Resolume addresses 256 universes per output. Each
   lumiverse starts at the Sub-Net/Universe of its first universe. Set each
-  lumiverse's target IP in Resolume after loading the preset. Slices are named
-  after the controller and its pixel, e.g. `Tree 7 120`.
+  lumiverse's target IP in Resolume after loading the preset. Back-to-back
+  pixels that sit on a straight, evenly spaced line within 1.5 px become one
+  rotated 1xN line slice (`--line-tolerance`, 0 = one slice per pixel), named
+  like `Tree 7 120-131`. On a 36,000-pixel test tree that is about 4,000 slices
+  and 17 MB; `--resolume-compact` drops the per-slice default parameters for
+  about 4.5 MB once Arena is confirmed to load it.
 - **Canvas preview**: a PNG of the composition with every sample square,
   coloured by lumiverse, to check the unwrap before loading it.
 

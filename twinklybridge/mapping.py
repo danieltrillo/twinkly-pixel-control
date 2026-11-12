@@ -1118,7 +1118,8 @@ def canvas_layout(
         nn = _nearest_distances(np.stack([u * comp_w, v * comp_h], axis=1))
         base = float(np.clip(0.7 * np.median(nn), 1.0, 40.0))
         margin = base / 2 + 1
-        xy = np.stack([u * comp_w, margin + v * (comp_h - 2 * margin)], axis=1)
+        # keep every sample square inside the composition, including at the seam
+        xy = np.stack([margin + u * (comp_w - 2 * margin), margin + v * (comp_h - 2 * margin)], axis=1)
     else:
         pts = np.array([[f["x"], f["y"]] for f in found], np.float64)
         if dims == 3:
@@ -1187,25 +1188,26 @@ def write_resolume(path: str, found, patches: dict[int, PixelPatch], xy, sizes, 
         uid += 1
         name = f"Lumiverse {li + 1}"
         slices = []
-        for k in sorted(
+        ordered = sorted(
             members, key=lambda k: (patches[found[k]["pixel"]].universe, patches[found[k]["pixel"]].channel)
-        ):
-            pp = patches[found[k]["pixel"]]
-            start = (pp.universe - base) * DMX_SLOTS + pp.channel
-            x, y = xy[k]
-            h = float(sizes[k]) / 2
+        )
+        channels = 4 if a.resolume_color == "rgbw" else 3
+        for run in line_runs(ordered, found, patches, xy, a.line_tolerance, channels, comp_w):
+            p_first, p_last = patches[found[run[0]]["pixel"]], patches[found[run[-1]]["pixel"]]
+            start = (p_first.universe - base) * DMX_SLOTS + p_first.channel
+            corners, angle = _run_rect(xy[run], float(np.mean(sizes[run])))
+            label = p_first.label if len(run) == 1 else f"{p_first.label}-{p_last.label.rsplit(' ', 1)[-1]}"
             uid += 1
             slices.append(
-                _RES_SLICE.format(
+                (_RES_SLICE_COMPACT if a.resolume_compact else _RES_SLICE).format(
                     uid=uid,
-                    name=_xml_attr(pp.label),
+                    name=_xml_attr(label),
                     fixture_id=a.resolume_fixture_id,
                     instance=instance_uuid,
                     start=start,
-                    x0=_num(max(0.0, x - h)),
-                    y0=_num(max(0.0, y - h)),
-                    x1=_num(min(comp_w, x + h)),
-                    y1=_num(min(comp_h, y + h)),
+                    orientation=_num(angle, 8),
+                    v="".join(f'<v x="{_num(cx)}" y="{_num(cy)}"/>' for cx, cy in corners),
+                    height=len(run),
                     color=a.resolume_color,
                 )
             )
@@ -1224,6 +1226,7 @@ def write_resolume(path: str, found, patches: dict[int, PixelPatch], xy, sizes, 
                 "first": artnet_label(base),
                 "last": artnet_label(last),
                 "pixels": len(members),
+                "slices": len(slices),
                 "resolume_subnet": (base >> 4) & 0xF,
                 "resolume_universe": base & 0xF,
             }
@@ -1234,12 +1237,71 @@ def write_resolume(path: str, found, patches: dict[int, PixelPatch], xy, sizes, 
     return summary
 
 
+def line_runs(ordered, found, patches, xy, tolerance: float, channels: int, comp_w: float) -> list[list[int]]:
+    """Group pixels into runs that one 1xN line fixture can cover.
+
+    A run is pixels with back-to-back DMX channels in one universe whose canvas
+    positions sit within `tolerance` px of evenly spaced points on a straight line,
+    which is what Resolume samples for a 1xN fixture. tolerance 0 = one slice per pixel.
+    """
+    runs: list[list[int]] = []
+    cur: list[int] = []
+    for k in ordered:
+        if cur and tolerance > 0:
+            prev = patches[found[cur[-1]]["pixel"]]
+            pp = patches[found[k]["pixel"]]
+            joins = (
+                pp.universe == prev.universe
+                and pp.channel == prev.channel + channels
+                and abs(xy[k][0] - xy[cur[-1]][0]) < comp_w / 2  # never across the unwrap seam
+            )
+            if joins:
+                cand = cur + [k]
+                pts = xy[cand]
+                t = np.linspace(0.0, 1.0, len(cand))[:, None]
+                pred = pts[0] + (pts[-1] - pts[0]) * t
+                if float(np.linalg.norm(pred - pts, axis=1).max()) <= tolerance:
+                    cur = cand
+                    continue
+        if cur:
+            runs.append(cur)
+        cur = [k]
+    if cur:
+        runs.append(cur)
+    return runs
+
+
+def _run_rect(pts: np.ndarray, width: float) -> tuple[list[tuple[float, float]], float]:
+    """Corners (Resolume order) and rotation of the input rect for a 1xN fixture along pts.
+
+    Resolume splits the rect's height into N cells, first pixel at the v0/v1 end, and
+    stores the rotation in radians plus the rotated corners (from a saved 7.24.3 preset).
+    """
+    n = len(pts)
+    width = max(width, 1.0)
+    if n == 1:
+        d, length = np.array([0.0, 1.0]), width
+    else:
+        span = pts[-1] - pts[0]
+        dist = float(np.linalg.norm(span))
+        d = span / max(dist, 1e-9)
+        length = max(dist * n / (n - 1), width)  # cell centres land on the first and last pixel
+    angle = math.atan2(-d[0], d[1])  # height axis (-sin, cos) points along the run
+    ex = np.array([math.cos(angle), math.sin(angle)])
+    ey = np.array([-math.sin(angle), math.cos(angle)])
+    c = (pts[0] + pts[-1]) / 2
+    hw, hl = width / 2, length / 2
+    corners = [c - hw * ex - hl * ey, c + hw * ex - hl * ey, c + hw * ex + hl * ey, c - hw * ex + hl * ey]
+    return [(float(p[0]), float(p[1])) for p in corners], angle
+
+
 def artnet_label(universe: int) -> str:
     return f"{universe >> 8}.{(universe >> 4) & 0xF}.{universe & 0xF}"
 
 
-def _num(v: float) -> str:
-    return f"{v:.3f}".rstrip("0").rstrip(".")
+def _num(v: float, digits: int = 3) -> str:
+    out = f"{v:.{digits}f}".rstrip("0").rstrip(".")
+    return "0" if out in ("-0", "") else out
 
 
 def _xml_attr(text: str) -> str:
@@ -1299,16 +1361,36 @@ _RES_SLICE = (
     + _range("Start Channel", "{start}", 1, 131072, default=1)
     + '<ParamChoice name="Filter Mode" T="INT32" default="0" value="0" storeChoices="0"/></Params>'
     '<Params name="Output"><Param name="Flip" T="UINT8" default="0" value="0"/>' + _RES_ADJ + "</Params>"
-    '<InputRect orientation="0"><v x="{x0}" y="{y0}"/><v x="{x1}" y="{y0}"/><v x="{x1}" y="{y1}"/><v x="{x0}" y="{y1}"/></InputRect>'
+    '<InputRect orientation="{orientation}">{v}</InputRect>'
     '<OutputRect orientation="0"><v x="-0.5" y="-0.5"/><v x="0.5" y="-0.5"/><v x="0.5" y="0.5"/><v x="-0.5" y="0.5"/></OutputRect>'
     '<FixtureInstance name="FixtureInstance"><Fixture name="Fixture" uuid="{instance}" fixtureName="">'
     '<Params name="Params"><ParamFixturePixels storage="0" name="Pixels">'
     + _range("Width", 1, 1, 512)
-    + _range("Height", 1, 1, 512)
+    + _range("Height", "{height}", 1, 512, default=1)
     + '<ParamChoice name="Color Format" T="STRING" default="rgb" value="{color}" storeChoices="0"/>'
     '<ParamChoice name="Distribution" T="INT32" default="170" value="170" storeChoices="0"/>'
     + _range("Gamma", 2.5, 1, 3)
     + "</ParamFixturePixels></Params></Fixture></FixtureInstance></DmxSlice>\n"
+)
+
+# The same slice without the parameters that only repeat Resolume's defaults (the
+# per-slice colour adjustments, opacity/bypass toggles, filter mode). Smaller, but
+# only use it once Arena is known to load it (--resolume-compact).
+_RES_SLICE_COMPACT = (
+    '<DmxSlice uniqueId="{uid}">'
+    '<Params name="Common"><Param name="Name" T="STRING" default="Layer" value="{name}"/></Params>'
+    '<Params name="Input">'
+    '<ParamChoice name="Fixture" T="STRING" default="" value="{fixture_id}" storeChoices="0"/>'
+    '<ParamRange name="Start Channel" T="DOUBLE" default="1" value="{start}"/>'
+    "</Params>"
+    '<InputRect orientation="{orientation}">{v}</InputRect>'
+    '<OutputRect orientation="0"><v x="-0.5" y="-0.5"/><v x="0.5" y="-0.5"/><v x="0.5" y="0.5"/><v x="-0.5" y="0.5"/></OutputRect>'
+    '<FixtureInstance name="FixtureInstance"><Fixture name="Fixture" uuid="{instance}" fixtureName="">'
+    '<Params name="Params"><ParamFixturePixels storage="0" name="Pixels">'
+    '<ParamRange name="Width" T="DOUBLE" default="1" value="1"/>'
+    '<ParamRange name="Height" T="DOUBLE" default="1" value="{height}"/>'
+    '<ParamChoice name="Color Format" T="STRING" default="rgb" value="{color}" storeChoices="0"/>'
+    "</ParamFixturePixels></Params></Fixture></FixtureInstance></DmxSlice>\n"
 )
 
 _RES_SCREEN_TAIL = (
@@ -1361,7 +1443,11 @@ def cmd_export(a) -> int:
         xy, sizes, layout = canvas_layout(found, dims, tuple(a.comp), a.layout)
         if a.resolume:
             lumis = write_resolume(a.resolume, found, patches, xy, sizes, a)
-            print(f"Resolume: {len(found)} pixel slices on {a.comp[0]}x{a.comp[1]} ({layout} layout) -> {a.resolume}")
+            n_slices = sum(lu["slices"] for lu in lumis)
+            print(
+                f"Resolume: {len(found)} pixels in {n_slices} slices on {a.comp[0]}x{a.comp[1]}"
+                f" ({layout} layout) -> {a.resolume}"
+            )
             for lu in lumis:
                 feed = f" via {lu['feed']}" if lu["feed"] else ""
                 print(
@@ -1547,6 +1633,18 @@ def main(argv=None) -> int:
         help="the Fixture choice each slice points at (from a saved one-pixel preset)",
     )
     e.add_argument("--resolume-fps", type=int, default=30, help="Lumiverse output frame rate (1-40)")
+    e.add_argument(
+        "--line-tolerance",
+        type=float,
+        default=1.5,
+        help="merge back-to-back pixels into 1xN line slices when they sit within this many composition px"
+        " of a straight, evenly spaced line (0 = one slice per pixel)",
+    )
+    e.add_argument(
+        "--resolume-compact",
+        action="store_true",
+        help="leave out per-slice parameters that only repeat Resolume's defaults (test that Arena loads it first)",
+    )
 
     sy = sub.add_parser("synth", help="render a fake scan video for testing")
     sy.add_argument("video")
