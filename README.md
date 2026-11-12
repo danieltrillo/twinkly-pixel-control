@@ -278,8 +278,9 @@ scan with the same controllers is fine. Then **Solve 3D** and download:
   pixels that sit on a straight, evenly spaced line within 1.5 px become one
   rotated 1xN line slice (`--line-tolerance`, 0 = one slice per pixel), named
   like `Tree 7 120-131`. On a 36,000-pixel test tree that is about 4,000 slices
-  and 17 MB; `--resolume-compact` drops the per-slice default parameters for
-  about 4.5 MB once Arena is confirmed to load it.
+  and 17 MB; slices leave out the per-slice default parameters, which
+  makes it about 4.5 MB (Arena 7.24.3 loads it the same; `--resolume-full`
+  writes the long form).
 - **Canvas preview**: a PNG of the composition with every sample square,
   coloured by lumiverse, to check the unwrap before loading it.
 

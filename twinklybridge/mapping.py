@@ -1375,7 +1375,7 @@ _RES_SLICE = (
 
 # The same slice without the parameters that only repeat Resolume's defaults (the
 # per-slice colour adjustments, opacity/bypass toggles, filter mode). Smaller, but
-# only use it once Arena is known to load it (--resolume-compact).
+# Arena 7.24.3 loads it the same as the full form (checked 2026-11-11); --resolume-full writes the long form.
 _RES_SLICE_COMPACT = (
     '<DmxSlice uniqueId="{uid}">'
     '<Params name="Common"><Param name="Name" T="STRING" default="Layer" value="{name}"/></Params>'
@@ -1641,10 +1641,13 @@ def main(argv=None) -> int:
         " of a straight, evenly spaced line (0 = one slice per pixel)",
     )
     e.add_argument(
-        "--resolume-compact",
-        action="store_true",
-        help="leave out per-slice parameters that only repeat Resolume's defaults (test that Arena loads it first)",
+        "--resolume-full",
+        dest="resolume_compact",
+        action="store_false",
+        help="write every per-slice parameter (default: leave out the ones that only repeat Resolume's defaults,"
+        " which Arena 7.24.3 loads the same)",
     )
+    e.add_argument("--resolume-compact", dest="resolume_compact", action="store_true", help=argparse.SUPPRESS)
 
     sy = sub.add_parser("synth", help="render a fake scan video for testing")
     sy.add_argument("video")

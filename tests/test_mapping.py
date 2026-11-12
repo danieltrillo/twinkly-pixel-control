@@ -350,7 +350,7 @@ def test_compact_slices_are_smaller(tmp_path):
     m = tmp_path / "map.json"
     m.write_text(json.dumps({"pixels": 200, "dims": 2, "found": found}))
     full, small = tmp_path / "full.xml", tmp_path / "small.xml"
-    pixelmap.main(["export", str(m), "--resolume", str(full), "--line-tolerance", "0"])
+    pixelmap.main(["export", str(m), "--resolume", str(full), "--line-tolerance", "0", "--resolume-full"])
     pixelmap.main(["export", str(m), "--resolume", str(small), "--line-tolerance", "0", "--resolume-compact"])
     assert small.stat().st_size < 0.4 * full.stat().st_size
     root = ET.parse(small).getroot()
