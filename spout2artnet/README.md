@@ -32,10 +32,10 @@ pixels.
 
 ```
 python spout2artnet.py info --map tree.xml
-python spout2artnet.py run  --map tree.xml --target 1=LUMIVERSE1_IP --target 2=LUMIVERSE2_IP
+python spout2artnet.py run  --map tree.xml --target 1=10.0.0.5 --target 2=10.0.0.6
 ```
 
-`run-tree.bat` is the same thing to double-click; put the same two IPs your Arena lumiverses send to now.
+`run-tree.bat` is the same thing to double-click (lumiverse 1 to 10.0.0.5, lumiverse 2 to 10.0.0.6).
 
 - `--target N=IP` sends lumiverse N (1, 2, ... in file order, as `info` shows)
   to that IP. Leave it out and the TargetIP saved in the XML is used, if it is
