@@ -221,6 +221,14 @@ the main input IP. The bridge binds one listen socket per IP, so the input IP
 must be a real address (not `0.0.0.0`) once you split. Madrix and grandMA3 can
 address the Net field directly and don't need this.
 
+### Resolume without Advanced Output (Spout)
+
+A whole tree is thousands of fixture slices, which Arena's Advanced Output
+struggles with. `spout2artnet/` is a small Windows app for the Arena machine:
+Arena shares its composition over Spout, and the app samples every mapped
+pixel from the same exported XML and sends the Art-Net itself. See
+[spout2artnet/README.md](spout2artnet/README.md).
+
 ## What the bridge does with each controller
 
 1. Logs in over HTTP and reads the model, firmware, LED count and RGB/RGBW.
