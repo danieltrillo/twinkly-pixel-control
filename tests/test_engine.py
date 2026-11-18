@@ -498,3 +498,57 @@ def test_packet_gap_is_capped_to_fit_half_a_frame():
     assert dev._packet_gap(7) == pytest.approx(0.5 / 60 / 6)
     dev, _ = _rt_device(1.0, fps=25)
     assert dev._packet_gap(7) == pytest.approx(0.001) and dev._packet_gap(1) == 0.0
+
+
+# -- whole-rig mapping scan ------------------------------------------------------
+
+
+def test_whole_rig_scan_numbers_pixels_across_controllers():
+    from types import SimpleNamespace
+
+    from twinklybridge import mapcode
+    from twinklybridge.twinkly import DeviceInfo
+
+    cfg = make_config(
+        [
+            {"name": "A", "ip": "10.0.0.1", "universe": "0.0.0", "pixels": 8},
+            {"name": "B", "ip": "10.0.0.2", "universe": "1.0.0", "pixels": 5},
+            {"name": "C", "ip": "10.0.0.3", "universe": "0.1.0", "pixels": 4},
+            {"name": "D", "ip": "10.0.0.4", "universe": "0.2.0", "pixels": 4},
+        ]
+    )
+    sent: dict[str, list[bytes]] = {}
+    eng = Engine(cfg, sender=lambda p, a: sent.setdefault(a[0], []).append(p) or True, hostname="box")
+    now = [50.0]
+    for dev, n in zip(eng.devices, (8, 5, 4, 4), strict=True):
+        dev.clock = lambda: now[0]
+        dev.order, dev.info, dev._ready, dev.state = (
+            "WRGB",
+            DeviceInfo(led_profile="RGBW", number_of_led=n),
+            True,
+            "ready",
+        )
+        dev.client = SimpleNamespace(token=b"\x01" * 8)
+        dev.rt_armed = True
+    eng.devices[2].info.group_mode = "slave"  # refuses realtime: left out, not fatal
+    eng.devices[3]._ready, eng.devices[3].state = False, "offline"
+
+    rig = engine_mod.start_rig_scan(eng.devices, slot=0.4, brightness=40, color="white", repeat=1)
+    assert rig["total"] == 13
+    assert [(d["name"], d["offset"], d["pixels"]) for d in rig["devices"]] == [("A", 0, 8), ("B", 8, 5)]
+    assert [s["name"] for s in rig["skipped"]] == ["C", "D"] and "group" in rig["skipped"][0]["reason"]
+    assert rig["devices"][1]["segments"] == [{"universe": 256, "channel": 0, "first_pixel": 0, "count": 5}]
+    a, b = eng.devices[0], eng.devices[1]
+    assert a.scan.started == b.scan.started and a.scan.rig and b.scan.offset == 8
+    assert a.scan.pass_seconds == b.scan.pass_seconds == len(mapcode.schedule(13)) * 0.4
+    assert eng.devices[2].scan is None
+
+    # every bit slot: a pixel is lit iff its rig-wide codeword says so, on both controllers
+    first_data = mapcode.LEAD + mapcode.MARK + 1
+    for bit in range(mapcode.word_bits(13)):
+        now[0] = a.scan.started + (first_data + 2 * bit) * 0.4 + 0.1
+        for dev, off in ((a, 0), (b, 8)):
+            dev.frame_step(now[0])
+            px = sent[dev.cfg.ip][-1][12:]
+            for i in range(dev.out_pixels):
+                assert (px[4 * i] == 40) == bool((mapcode.codeword(off + i, 13) >> bit) & 1)

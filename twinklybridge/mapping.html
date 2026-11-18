@@ -120,7 +120,7 @@
     <h2>6. Export</h2>
     <select id="source"></select>
     <div class="row" style="margin-top:8px" id="exports"></div>
-    <div class="small muted" style="margin-top:8px">MADRIX 5: Patch Editor → File → Import Fixture List (comma, header line on). Resolume Arena 7: drop the XML in the Advanced Output presets folder (preset menu → Reveal), then load it.</div>
+    <div class="small muted" style="margin-top:8px">Whole rig: the 3D solve unwraps around the trunk (left-right = around the tree, front in the middle, seam at the back; up-down = height) and the Resolume XML gets one lumiverse per Art-Net net. Set each lumiverse's target IP in Resolume after loading.<br>MADRIX 5: Patch Editor → File → Import Fixture List (comma, header line on). Resolume Arena 7: drop the XML in the Advanced Output presets folder (preset menu → Reveal), then load it.</div>
   </section>
 
   <section class="card">
@@ -170,7 +170,7 @@ function render() {
   const names = s.devices.map((d) => d.name);
   if (!names.includes(device)) device = names[0] || "";
   if (sel.dataset.names !== names.join("\n")) {
-    sel.innerHTML = s.devices.map((d) => `<option value="${esc(d.name)}">${esc(d.name)} · ${esc(d.ip)}</option>`).join("");
+    sel.innerHTML = s.devices.map((d) => `<option value="${esc(d.name)}">${d.rig ? `🎄 All controllers · ${esc(d.ip)}` : `${esc(d.name)} · ${esc(d.ip)}`}</option>`).join("");
     sel.dataset.names = names.join("\n");
   }
   sel.value = device;
@@ -178,7 +178,12 @@ function render() {
   if (d) {
     const cls = d.ready ? "ok" : "bad";
     const warn = d.warnings.length ? ` <span class="warn">${esc(d.warnings.join("; "))}</span>` : "";
-    $("devstate").innerHTML = `<span class="${cls}">${esc(d.state)}</span> · ${d.pixels} pixels${warn}${d.error ? ` <span class="bad">${esc(d.error)}</span>` : ""}`;
+    let last = "";
+    if (d.rig && d.last_scan) {
+      const sk = d.last_scan.skipped.length ? `, <span class="warn">left out: ${esc(d.last_scan.skipped.map((x) => x.name).join(", "))}</span>` : "";
+      last = `<br>Last whole-rig scan ${when(d.last_scan.created)}: ${d.last_scan.controllers} controllers, ${d.last_scan.pixels} pixels${sk}. New clips decode against it.`;
+    }
+    $("devstate").innerHTML = `<span class="${cls}">${esc(d.state)}</span> · ${d.pixels} pixels${warn}${d.error ? ` <span class="bad">${esc(d.error)}</span>` : ""}${last}`;
   } else {
     $("devstate").textContent = "";
   }
@@ -194,9 +199,14 @@ function render() {
   $("start").disabled = !d || !d.ready || busy;
   if (scan) {
     const pct = Math.round(100 * scan.elapsed / (scan.elapsed + scan.remaining));
-    $("scanstate").innerHTML = `<span class="ok">Scanning</span> pass ${scan.pass}/${scan.passes} · ${mmss(scan.remaining)} left · ${scan.pixels} px, ${scan.pass_seconds} s per pass<div class="bar"><div style="width:${pct}%"></div></div>`;
-  } else if (!$("scanstate").dataset.msg) {
-    $("scanstate").innerHTML = `The bridge takes over this controller and blinks every pixel's number. Start it, then record.`;
+    const who = d.rig ? ` · ${scan.controllers} controllers` : "";
+    $("scanstate").innerHTML = `<span class="ok">Scanning</span> pass ${scan.pass}/${scan.passes} · ${mmss(scan.remaining)} left · ${scan.pixels} px${who}, ${scan.pass_seconds} s per pass<div class="bar"><div style="width:${pct}%"></div></div>`;
+  } else if ($("scanstate").dataset.msg) {
+    $("scanstate").innerHTML = $("scanstate").dataset.msg;
+  } else {
+    $("scanstate").innerHTML = d && d.rig
+      ? `Every ready controller blinks at once, each pixel with its own number across the whole rig. Start it, then film the tree from each spot.`
+      : `The bridge takes over this controller and blinks every pixel's number. Start it, then record.`;
   }
 
   const jobs = (s.jobs || []).filter((j) => j.device === device);
@@ -236,8 +246,9 @@ function render() {
   }
   const slug = (clips[0] || solve || {}).slug;
   const src = srcSel.value;
-  $("exports").innerHTML = src && slug ? [["madrix.csv", "MADRIX CSV"], ["resolume.xml", "Resolume XML"], ["map.csv", "positions CSV"], ["map.json", "map.json"]]
-    .map(([k, t]) => `<a class="dl" href="api/map/export/${encodeURIComponent(slug)}/${encodeURIComponent(src)}/${k}" download>${t}</a>`).join("") : "";
+  const kinds = [["resolume.xml", "Resolume XML"], ["canvas.png", "Canvas preview"], ["madrix.csv", "MADRIX CSV"], ["map.csv", "positions CSV"], ["map.json", "map.json"]];
+  $("exports").innerHTML = src && slug ? kinds
+    .map(([k, t]) => `<a class="dl" href="api/map/export/${encodeURIComponent(slug)}/${encodeURIComponent(src)}/${k}"${k === "canvas.png" ? ` target="_blank"` : " download"}>${t}</a>`).join("") : "";
 
   const disk = s.disk || {};
   $("storage").innerHTML = `${disk.used_mb} MB used by mapping · ${disk.free_mb} MB free on disk (uploads stop at ${disk.min_free_mb} MB) · clips are ${s.settings.keep_clips ? "kept" : "deleted after decoding"} · ${esc(disk.dir)}`;
@@ -258,7 +269,8 @@ function jobHtml(j) {
   }
   const size = j.clip ? ` · ${(j.clip.bytes / 1048576).toFixed(0)} MB${j.clip.kept ? "" : " (clip deleted)"}` : "";
   const logLink = j.files.includes("log.txt") ? ` · <a href="api/map/jobs/${encodeURIComponent(j.slug)}/${j.id}/log.txt" target="_blank">log</a>` : "";
-  return `<div class="job">${img}<div class="body"><div><b>${esc(j.label || "clip")}</b> <span class="muted">${when(j.created)} · ${j.pixels} px${size}</span></div><div>${line}${logLink}</div></div><button data-del="${esc(j.slug)}/${j.id}">✕</button></div>`;
+  const rig = j.rig ? ` · ${j.rig.controllers} controllers` : "";
+  return `<div class="job">${img}<div class="body"><div><b>${esc(j.label || "clip")}</b> <span class="muted">${when(j.created)} · ${j.pixels} px${rig}${size}</span></div><div>${line}${logLink}</div></div><button data-del="${esc(j.slug)}/${j.id}">✕</button></div>`;
 }
 
 $("device").onchange = () => { device = $("device").value; localStorage.setItem("mapDevice", device); render(); };
@@ -267,8 +279,10 @@ $("source").onchange = render;
 $("start").onclick = async () => {
   busy = true; $("start").disabled = true;
   try {
-    await post("api/map/scan", { device, passes: +$("passes").value, brightness: +$("brightness").value, slot: +$("slot").value, color: $("color").value });
-    $("scanstate").dataset.msg = "";
+    const r = await post("api/map/scan", { device, passes: +$("passes").value, brightness: +$("brightness").value, slot: +$("slot").value, color: $("color").value });
+    $("scanstate").dataset.msg = r.skipped && r.skipped.length
+      ? `<span class="warn">Left out of the last scan:</span> ${r.skipped.map((x) => `${esc(x.name)}: ${esc(x.reason)}`).join("; ")}`
+      : "";
   } catch (e) { alert(e.message); }
   busy = false; refresh();
 };

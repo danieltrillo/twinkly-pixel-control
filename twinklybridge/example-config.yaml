@@ -78,5 +78,7 @@ web:
 #   brightness: 96          # 1-255 for the lit pixels; lower if the camera blooms
 #   color: white            # white (W chip) | rgb | green
 #   passes: 10              # how often the code repeats per scan (about 18 s each)
+#   comp_width: 1920        # Resolume composition the export lays the pixels out on
+#   comp_height: 1080
 
 log_level: info             # debug | info | warning | error
